@@ -21,6 +21,15 @@ return [
         'bmp',
         'ico',
         'pdf',
+        'mp4',
+        'webm',
+        'mov',
+        'avi',
+        'mkv',
+        'mp3',
+        'wav',
+        'ogg',
+        'aac',
     ],
 
     /*
@@ -33,6 +42,7 @@ return [
     */
 
     'supported_mimes' => [
+        // Images
         'image/jpeg',
         'image/png',
         'image/webp',
@@ -42,6 +52,25 @@ return [
         'image/x-ms-bmp',
         'image/x-icon',
         'image/vnd.microsoft.icon',
+        'application/pdf',
+        // Videos
+        'video/mp4',
+        'video/webm',
+        'video/quicktime',
+        'video/x-msvideo',
+        'video/x-matroska',
+        'video/mpeg',
+        'video/ogg',
+        // Audio
+        'audio/mpeg',
+        'audio/mp3',
+        'audio/wav',
+        'audio/x-wav',
+        'audio/ogg',
+        'audio/aac',
+        'audio/x-m4a',
+        'audio/flac',
+        'application/octet-stream',
     ],
 
     /*

@@ -1,9 +1,10 @@
 FROM php:8.2-apache
 
-# Install system dependencies & graphic libraries for GD (JPG, PNG, WebP, AVIF, GIF, BMP)
+# Install system dependencies, ffmpeg & graphic libraries for GD (JPG, PNG, WebP, AVIF, GIF, BMP)
 RUN apt-get update && apt-get install -y \
     git \
     curl \
+    ffmpeg \
     libpng-dev \
     libonig-dev \
     libxml2-dev \

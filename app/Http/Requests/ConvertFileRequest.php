@@ -35,8 +35,11 @@ class ConvertFileRequest extends FormRequest
      */
     public function rules(): array
     {
-        $supportedFormats = config('file_converter.supported_formats', ['jpg', 'jpeg', 'png', 'webp', 'gif', 'avif', 'bmp', 'ico', 'pdf']);
-        $supportedMimes = config('file_converter.supported_mimes', []);
+        $supportedFormats = config('file_converter.supported_formats', [
+            'jpg', 'jpeg', 'png', 'webp', 'gif', 'avif', 'bmp', 'ico', 'pdf',
+            'mp4', 'webm', 'mov', 'avi', 'mkv',
+            'mp3', 'wav', 'ogg', 'aac'
+        ]);
         $maxKb = config('file_converter.max_file_size', 102400);
 
         return [
@@ -44,8 +47,6 @@ class ConvertFileRequest extends FormRequest
                 'required',
                 'file',
                 'max:' . $maxKb,
-                'mimes:' . implode(',', array_diff($supportedFormats, ['pdf'])),
-                'mimetypes:' . implode(',', $supportedMimes),
             ],
             'format' => [
                 'required',
@@ -60,16 +61,18 @@ class ConvertFileRequest extends FormRequest
      */
     public function messages(): array
     {
-        $supported = config('file_converter.supported_formats', ['jpg', 'jpeg', 'png', 'webp', 'gif', 'avif', 'bmp', 'ico', 'pdf']);
+        $supported = config('file_converter.supported_formats', [
+            'jpg', 'jpeg', 'png', 'webp', 'gif', 'avif', 'bmp', 'ico', 'pdf',
+            'mp4', 'webm', 'mov', 'avi', 'mkv',
+            'mp3', 'wav', 'ogg', 'aac'
+        ]);
 
         return [
-            'file.required' => 'An image file is required.',
+            'file.required' => 'A file is required for conversion.',
             'file.file' => 'The uploaded item must be a valid file.',
             'file.max' => 'The file size must not exceed ' . (config('file_converter.max_file_size', 102400) / 1024) . ' MB.',
-            'file.mimes' => 'The file format is unsupported. Allowed: ' . strtoupper(implode(', ', array_diff($supported, ['pdf']))),
-            'file.mimetypes' => 'The file MIME type is unsupported.',
             'format.required' => 'The target conversion format is required.',
-            'format.in' => 'The requested conversion format is not supported. Allowed formats: ' . strtoupper(implode(', ', $supported)),
+            'format.in' => 'The requested conversion format is not supported. Allowed: ' . strtoupper(implode(', ', $supported)),
         ];
     }
 
