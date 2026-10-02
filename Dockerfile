@@ -23,6 +23,16 @@ RUN apt-get update && apt-get install -y \
 # Enable Apache mod_rewrite
 RUN a2enmod rewrite
 
+# Configure PHP & Apache for up to 100MB uploads, 512M memory, and 300s execution
+RUN { \
+        echo 'upload_max_filesize = 105M'; \
+        echo 'post_max_size = 110M'; \
+        echo 'memory_limit = 512M'; \
+        echo 'max_execution_time = 300'; \
+        echo 'max_input_time = 300'; \
+    } > /usr/local/etc/php/conf.d/uploads.ini \
+    && echo 'LimitRequestBody 115343360' >> /etc/apache2/apache2.conf
+
 # Set Apache document root to Laravel public folder
 ENV APACHE_DOCUMENT_ROOT /var/www/html/public
 RUN sed -ri -e 's!/var/www/html!${APACHE_DOCUMENT_ROOT}!g' /etc/apache2/sites-available/*.conf

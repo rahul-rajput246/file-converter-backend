@@ -237,12 +237,16 @@ class FileProcessingService
 
         // Case 2: Primary native renderer: pdftoppm (poppler-utils) - ultra crisp 150 DPI
         if ($this->hasCommand('pdftoppm')) {
-            $cmd = "pdftoppm -png -r 150 -f 1 -l 1 {$inputEscaped} " . escapeshellarg($prefix) . " 2>&1";
+            $isJpgTarget = ($targetFormat === 'jpg' || $targetFormat === 'jpeg');
+            $formatFlag = $isJpgTarget ? '-jpeg -jpegopt quality=90' : '-png';
+            $extSearch = $isJpgTarget ? 'jpg' : 'png';
+
+            $cmd = "pdftoppm {$formatFlag} -r 150 -f 1 -l 1 {$inputEscaped} " . escapeshellarg($prefix) . " 2>&1";
             $output = [];
             $code = 0;
             @exec($cmd, $output, $code);
 
-            $matches = glob("{$prefix}*.png");
+            $matches = glob("{$prefix}*.{$extSearch}");
             if (!empty($matches) && file_exists($matches[0])) {
                 $renderedFile = $matches[0];
             }
@@ -250,9 +254,12 @@ class FileProcessingService
 
         // Case 3: Fallback using Ghostscript (gs)
         if (!$renderedFile && $this->hasCommand('gs')) {
-            $outPath = $prefix . '-1.png';
+            $isJpgTarget = ($targetFormat === 'jpg' || $targetFormat === 'jpeg');
+            $device = $isJpgTarget ? 'jpeg' : 'png16m';
+            $ext = $isJpgTarget ? 'jpg' : 'png';
+            $outPath = $prefix . "-1.{$ext}";
             $outEscaped = escapeshellarg($outPath);
-            $cmd = "gs -dNOPAUSE -dBATCH -sDEVICE=png16m -r150 -dFirstPage=1 -dLastPage=1 -sOutputFile={$outEscaped} {$inputEscaped} 2>&1";
+            $cmd = "gs -dNOPAUSE -dBATCH -sDEVICE={$device} -r150 -dFirstPage=1 -dLastPage=1 -sOutputFile={$outEscaped} {$inputEscaped} 2>&1";
             $output = [];
             $code = 0;
             @exec($cmd, $output, $code);
@@ -318,7 +325,16 @@ class FileProcessingService
         }
 
         try {
-            // Read rendered raster page into Intervention Image
+            // Zero-copy fast return: if target is PNG and rendered is PNG, or target is JPG and rendered is JPG
+            if ($targetFormat === 'png' && str_ends_with(strtolower($renderedFile), '.png')) {
+                return (string) file_get_contents($renderedFile);
+            }
+
+            if (($targetFormat === 'jpg' || $targetFormat === 'jpeg') && (str_ends_with(strtolower($renderedFile), '.jpg') || str_ends_with(strtolower($renderedFile), '.jpeg'))) {
+                return (string) file_get_contents($renderedFile);
+            }
+
+            // Read rendered raster page into Intervention Image for transcoding to WebP, AVIF, GIF, BMP, ICO
             $image = Image::read($renderedFile);
 
             $binaryData = match ($targetFormat) {
