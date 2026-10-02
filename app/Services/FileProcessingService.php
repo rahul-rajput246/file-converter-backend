@@ -241,7 +241,7 @@ class FileProcessingService
             $formatFlag = $isJpgTarget ? '-jpeg -jpegopt quality=90' : '-png';
             $extSearch = $isJpgTarget ? 'jpg' : 'png';
 
-            $cmd = "pdftoppm {$formatFlag} -r 150 -f 1 -l 1 {$inputEscaped} " . escapeshellarg($prefix) . " 2>&1";
+            $cmd = "pdftoppm {$formatFlag} -r 130 -scale-to-x 1920 -scale-to-y -1 -f 1 -l 1 {$inputEscaped} " . escapeshellarg($prefix) . " 2>&1";
             $output = [];
             $code = 0;
             @exec($cmd, $output, $code);
@@ -358,6 +358,9 @@ class FileProcessingService
                         @unlink($file);
                     }
                 }
+            }
+            if (function_exists('gc_collect_cycles')) {
+                @gc_collect_cycles();
             }
         }
     }

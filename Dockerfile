@@ -23,13 +23,24 @@ RUN apt-get update && apt-get install -y \
 # Enable Apache mod_rewrite
 RUN a2enmod rewrite
 
-# Configure PHP & Apache for up to 100MB uploads, 512M memory, and 300s execution
+# Tune Apache MPM prefork for low-memory Render 512MB free-tier container
 RUN { \
-        echo 'upload_max_filesize = 105M'; \
-        echo 'post_max_size = 110M'; \
-        echo 'memory_limit = 512M'; \
-        echo 'max_execution_time = 300'; \
-        echo 'max_input_time = 300'; \
+        echo '<IfModule mpm_prefork_module>'; \
+        echo '    StartServers             2'; \
+        echo '    MinSpareServers          1'; \
+        echo '    MaxSpareServers          2'; \
+        echo '    MaxRequestWorkers        4'; \
+        echo '    MaxConnectionsPerChild   100'; \
+        echo '</IfModule>'; \
+    } > /etc/apache2/mods-available/mpm_prefork.conf
+
+# Configure PHP & Apache for up to 100MB uploads, 256M memory, and 180s execution
+RUN { \
+        echo 'upload_max_filesize = 100M'; \
+        echo 'post_max_size = 105M'; \
+        echo 'memory_limit = 256M'; \
+        echo 'max_execution_time = 180'; \
+        echo 'max_input_time = 180'; \
     } > /usr/local/etc/php/conf.d/uploads.ini \
     && echo 'LimitRequestBody 115343360' >> /etc/apache2/apache2.conf
 
