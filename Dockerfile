@@ -5,6 +5,8 @@ RUN apt-get update && apt-get install -y \
     git \
     curl \
     ffmpeg \
+    poppler-utils \
+    ghostscript \
     libpng-dev \
     libonig-dev \
     libxml2-dev \

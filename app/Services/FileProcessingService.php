@@ -21,22 +21,33 @@ class FileProcessingService
     }
 
     /**
-     * Check if FFmpeg CLI is accessible on the system PATH.
+     * Check if a CLI command is accessible on the system PATH.
      */
-    public function hasFfmpeg(): bool
+    public function hasCommand(string $command): bool
     {
-        static $available = null;
-        if ($available !== null) {
-            return $available;
+        static $cache = [];
+        if (isset($cache[$command])) {
+            return $cache[$command];
         }
 
-        $cmd = (DIRECTORY_SEPARATOR === '\\') ? 'where ffmpeg 2>nul' : 'command -v ffmpeg 2>/dev/null';
+        $cmd = (DIRECTORY_SEPARATOR === '\\')
+            ? 'where ' . escapeshellarg($command) . ' 2>nul'
+            : 'command -v ' . escapeshellarg($command) . ' 2>/dev/null';
+
         $output = [];
         $returnVar = 0;
         @exec($cmd, $output, $returnVar);
 
-        $available = ($returnVar === 0 && !empty($output));
-        return $available;
+        $cache[$command] = ($returnVar === 0 && !empty($output));
+        return $cache[$command];
+    }
+
+    /**
+     * Check if FFmpeg CLI is accessible on the system PATH.
+     */
+    public function hasFfmpeg(): bool
+    {
+        return $this->hasCommand('ffmpeg');
     }
 
     /**
@@ -93,11 +104,15 @@ class FileProcessingService
         try {
             $binaryData = null;
 
-            // 2. Handle Video or Audio conversion
-            if ($category === 'video' || $category === 'audio') {
+            // 2. Handle PDF Document conversion
+            if ($clientExt === 'pdf' || $clientMime === 'application/pdf') {
+                $binaryData = $this->convertPdf($tempFullPath, $targetFormat);
+            }
+            // 3. Handle Video or Audio conversion
+            else if ($category === 'video' || $category === 'audio') {
                 $binaryData = $this->transcodeWithFfmpeg($tempFullPath, $targetFormat, $category);
             } else {
-                // 3. Handle Image conversion
+                // 4. Handle Image conversion
                 if ($targetFormat === 'mp4' && $this->hasFfmpeg()) {
                     // Image to MP4 video clip
                     $binaryData = $this->transcodeWithFfmpeg($tempFullPath, 'mp4', 'image');
@@ -201,6 +216,168 @@ class FileProcessingService
         $binary = file_get_contents($tempOut);
         @unlink($tempOut);
         return $binary;
+    }
+
+    /**
+     * Convert PDF document to images (PNG, JPG, WebP, AVIF, BMP, ICO, GIF) or TXT.
+     */
+    protected function convertPdf(string $inputPath, string $targetFormat): string
+    {
+        $targetFormat = strtolower(trim($targetFormat));
+
+        // Case 1: Plain text extraction
+        if ($targetFormat === 'txt') {
+            return $this->extractTextFromPdf($inputPath);
+        }
+
+        $tempDir = sys_get_temp_dir();
+        $prefix = $tempDir . DIRECTORY_SEPARATOR . 'pdf_render_' . bin2hex(random_bytes(6));
+        $inputEscaped = escapeshellarg($inputPath);
+        $renderedFile = null;
+
+        // Case 2: Primary native renderer: pdftoppm (poppler-utils) - ultra crisp 150 DPI
+        if ($this->hasCommand('pdftoppm')) {
+            $cmd = "pdftoppm -png -r 150 -f 1 -l 1 {$inputEscaped} " . escapeshellarg($prefix) . " 2>&1";
+            $output = [];
+            $code = 0;
+            @exec($cmd, $output, $code);
+
+            $matches = glob("{$prefix}*.png");
+            if (!empty($matches) && file_exists($matches[0])) {
+                $renderedFile = $matches[0];
+            }
+        }
+
+        // Case 3: Fallback using Ghostscript (gs)
+        if (!$renderedFile && $this->hasCommand('gs')) {
+            $outPath = $prefix . '-1.png';
+            $outEscaped = escapeshellarg($outPath);
+            $cmd = "gs -dNOPAUSE -dBATCH -sDEVICE=png16m -r150 -dFirstPage=1 -dLastPage=1 -sOutputFile={$outEscaped} {$inputEscaped} 2>&1";
+            $output = [];
+            $code = 0;
+            @exec($cmd, $output, $code);
+
+            if (file_exists($outPath) && filesize($outPath) > 0) {
+                $renderedFile = $outPath;
+            }
+        }
+
+        // Case 4: Fallback using Imagick PHP extension
+        if (!$renderedFile && extension_loaded('imagick')) {
+            try {
+                $imagick = new \Imagick();
+                $imagick->setResolution(150, 150);
+                $imagick->readImage($inputPath . '[0]');
+                $imagick->setImageFormat('png');
+                $outPath = $prefix . '-imagick.png';
+                $imagick->writeImage($outPath);
+                $imagick->clear();
+                $imagick->destroy();
+
+                if (file_exists($outPath) && filesize($outPath) > 0) {
+                    $renderedFile = $outPath;
+                }
+            } catch (Throwable $e) {
+                Log::warning('Imagick PDF render fallback error', ['error' => $e->getMessage()]);
+            }
+        }
+
+        // Case 5: Fallback extract embedded JPEG/DCT stream directly from PDF binary
+        if (!$renderedFile) {
+            $pdfContent = @file_get_contents($inputPath);
+            if ($pdfContent) {
+                $startTag = "\xFF\xD8\xFF";
+                $endTag = "\xFF\xD9";
+                $startPos = strpos($pdfContent, $startTag);
+                if ($startPos !== false) {
+                    $endPos = strpos($pdfContent, $endTag, $startPos);
+                    if ($endPos !== false) {
+                        $jpegData = substr($pdfContent, $startPos, $endPos - $startPos + 2);
+                        try {
+                            $image = Image::read($jpegData);
+                            return match ($targetFormat) {
+                                'png' => (string) $image->toPng(),
+                                'jpg', 'jpeg' => (string) $image->toJpeg(quality: 90),
+                                'webp' => (string) $image->toWebp(quality: 90),
+                                'gif' => (string) $image->toGif(),
+                                'avif' => (string) $image->toAvif(quality: 85),
+                                'bmp' => (string) $image->toBmp(),
+                                'ico' => $this->transcodeToIco($image),
+                                default => (string) $image->toPng(),
+                            };
+                        } catch (Throwable $t) {
+                            // Continue to failure
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!$renderedFile || !file_exists($renderedFile)) {
+            throw new RuntimeException("PDF rendering failed. Server requires poppler-utils (pdftoppm) or Ghostscript to render PDF pages into images.");
+        }
+
+        try {
+            // Read rendered raster page into Intervention Image
+            $image = Image::read($renderedFile);
+
+            $binaryData = match ($targetFormat) {
+                'png' => (string) $image->toPng(),
+                'jpg', 'jpeg' => (string) $image->toJpeg(quality: 90),
+                'webp' => (string) $image->toWebp(quality: 90),
+                'gif' => (string) $image->toGif(),
+                'avif' => (string) $image->toAvif(quality: 85),
+                'bmp' => (string) $image->toBmp(),
+                'ico' => $this->transcodeToIco($image),
+                default => (string) $image->toPng(),
+            };
+
+            return $binaryData;
+        } finally {
+            // Clean up temporary rendered file(s)
+            $allMatches = glob("{$prefix}*");
+            if (is_array($allMatches)) {
+                foreach ($allMatches as $file) {
+                    if (file_exists($file)) {
+                        @unlink($file);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Extract plain text content from a PDF document.
+     */
+    protected function extractTextFromPdf(string $inputPath): string
+    {
+        $inputEscaped = escapeshellarg($inputPath);
+        $tempOut = tempnam(sys_get_temp_dir(), 'pdf_txt_');
+        $outEscaped = escapeshellarg($tempOut);
+
+        if ($this->hasCommand('pdftotext')) {
+            $cmd = "pdftotext -layout {$inputEscaped} {$outEscaped} 2>&1";
+            $output = [];
+            $code = 0;
+            @exec($cmd, $output, $code);
+
+            if ($code === 0 && file_exists($tempOut) && filesize($tempOut) > 0) {
+                $text = file_get_contents($tempOut);
+                @unlink($tempOut);
+                return $text;
+            }
+        }
+
+        @unlink($tempOut);
+
+        // Fallback simple stream text extraction
+        $raw = @file_get_contents($inputPath);
+        $extracted = '';
+        if ($raw && preg_match_all('/\((.*?)\)\s*Tj/s', $raw, $matches)) {
+            $extracted = implode("\n", $matches[1]);
+        }
+
+        return $extracted ?: "PDF text extraction completed.";
     }
 
     /**

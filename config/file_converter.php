@@ -30,6 +30,7 @@ return [
         'wav',
         'ogg',
         'aac',
+        'txt',
     ],
 
     /*
@@ -70,6 +71,7 @@ return [
         'audio/aac',
         'audio/x-m4a',
         'audio/flac',
+        'text/plain',
         'application/octet-stream',
     ],
 

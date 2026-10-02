@@ -38,7 +38,7 @@ class ConvertFileRequest extends FormRequest
         $supportedFormats = config('file_converter.supported_formats', [
             'jpg', 'jpeg', 'png', 'webp', 'gif', 'avif', 'bmp', 'ico', 'pdf',
             'mp4', 'webm', 'mov', 'avi', 'mkv',
-            'mp3', 'wav', 'ogg', 'aac'
+            'mp3', 'wav', 'ogg', 'aac', 'txt'
         ]);
         $maxKb = config('file_converter.max_file_size', 102400);
 
@@ -64,7 +64,7 @@ class ConvertFileRequest extends FormRequest
         $supported = config('file_converter.supported_formats', [
             'jpg', 'jpeg', 'png', 'webp', 'gif', 'avif', 'bmp', 'ico', 'pdf',
             'mp4', 'webm', 'mov', 'avi', 'mkv',
-            'mp3', 'wav', 'ogg', 'aac'
+            'mp3', 'wav', 'ogg', 'aac', 'txt'
         ]);
 
         return [
