@@ -38,7 +38,10 @@ class FileController extends Controller
 
             $result = $this->fileProcessingService->convertImage($file, $format);
 
-            $downloadUrl = url("/api/files/download/{$result['filename']}");
+            $isSecure = $request->isSecure() || $request->header('x-forwarded-proto') === 'https' || app()->environment('production');
+            $downloadUrl = $isSecure 
+                ? secure_url("/api/files/download/{$result['filename']}") 
+                : url("/api/files/download/{$result['filename']}");
 
             return response()->json([
                 'success' => true,
@@ -77,7 +80,10 @@ class FileController extends Controller
 
             $result = $this->fileProcessingService->compressImage($file, $level, $targetSizeKb);
 
-            $downloadUrl = url("/api/files/download/{$result['filename']}");
+            $isSecure = $request->isSecure() || $request->header('x-forwarded-proto') === 'https' || app()->environment('production');
+            $downloadUrl = $isSecure 
+                ? secure_url("/api/files/download/{$result['filename']}") 
+                : url("/api/files/download/{$result['filename']}");
 
             return response()->json([
                 'success' => true,
