@@ -2,7 +2,13 @@
 
 use Illuminate\Support\Facades\Route;
 
-Route::get('/', function () {
+Route::withoutMiddleware([
+    \Illuminate\Session\Middleware\StartSession::class,
+    \Illuminate\Cookie\Middleware\EncryptCookies::class,
+    \App\Http\Middleware\EncryptCookies::class,
+    \Illuminate\Foundation\Http\Middleware\VerifyCsrfToken::class,
+    \App\Http\Middleware\VerifyCsrfToken::class,
+])->get('/', function () {
     return response()->json([
         'status' => 'online',
         'service' => 'FileFlow REST API Backend',

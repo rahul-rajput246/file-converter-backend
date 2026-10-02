@@ -28,6 +28,11 @@ RUN sed -ri -e 's!/var/www/!${APACHE_DOCUMENT_ROOT}!g' /etc/apache2/apache2.conf
 # Configure Apache server name
 RUN echo "ServerName localhost" >> /etc/apache2/apache2.conf
 
+# Production defaults
+ENV APP_ENV=production
+ENV APP_DEBUG=false
+ENV APP_KEY=base64:v1ZfI3hW9V7M2n8Q6P4j0L5k8S1a3D5f7G9h2J4k6L8=
+
 # Install Composer
 COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
 
