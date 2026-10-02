@@ -98,19 +98,17 @@ class FileProcessingService
                 $binaryData = $this->transcodeWithFfmpeg($tempFullPath, $targetFormat, $category);
             } else {
                 // 3. Handle Image conversion
-                if ($targetFormat === 'gif') {
-                    // Generate a true animated looping GIF (not a static single-frame GIF)
-                    $binaryData = $this->generateAnimatedGifFromImage($tempFullPath);
-                } elseif ($targetFormat === 'mp4' && $this->hasFfmpeg()) {
+                if ($targetFormat === 'mp4' && $this->hasFfmpeg()) {
                     // Image to MP4 video clip
                     $binaryData = $this->transcodeWithFfmpeg($tempFullPath, 'mp4', 'image');
                 } else {
-                    // Standard image format conversion
+                    // Standard clean image format conversion (GIF, PNG, JPG, WebP, AVIF, BMP, ICO, PDF)
                     $image = Image::read($tempFullPath);
                     $binaryData = match ($targetFormat) {
                         'jpg', 'jpeg' => (string) $image->toJpeg(quality: 90),
                         'png' => (string) $image->toPng(),
                         'webp' => (string) $image->toWebp(quality: 90),
+                        'gif' => (string) $image->toGif(),
                         'avif' => (string) $image->toAvif(quality: 85),
                         'bmp' => (string) $image->toBmp(),
                         'ico' => $this->transcodeToIco($image),
@@ -203,196 +201,6 @@ class FileProcessingService
         $binary = file_get_contents($tempOut);
         @unlink($tempOut);
         return $binary;
-    }
-
-    /**
-     * Generate a genuine animated looping GIF from a static image.
-     * Uses FFmpeg when available, or built-in multi-frame GIF generator with infinite loop.
-     */
-    protected function generateAnimatedGifFromImage(string $imagePath): string
-    {
-        // Try pure PHP multi-frame animated GIF engine (guaranteed smooth looping animation)
-        try {
-            $data = $this->createAnimatedGifFramesPurePhp($imagePath);
-            if (!empty($data)) {
-                return $data;
-            }
-        } catch (Throwable $e) {
-            Log::warning('Pure PHP animated GIF generation fallback', ['error' => $e->getMessage()]);
-        }
-
-        // Fallback to Intervention Image static GIF if GD animation fails
-        $image = Image::read($imagePath);
-        return (string) $image->toGif();
-    }
-
-    /**
-     * Create an 8-frame smooth breathing/zoom animated looping GIF using PHP GD.
-     */
-    protected function createAnimatedGifFramesPurePhp(string $sourcePath): string
-    {
-        $info = @getimagesize($sourcePath);
-        $mime = $info['mime'] ?? '';
-
-        $src = match ($mime) {
-            'image/png' => @imagecreatefrompng($sourcePath),
-            'image/jpeg' => @imagecreatefromjpeg($sourcePath),
-            'image/webp' => @imagecreatefromwebp($sourcePath),
-            'image/gif' => @imagecreatefromgif($sourcePath),
-            'image/bmp', 'image/x-ms-bmp' => @imagecreatefrombmp($sourcePath),
-            default => null,
-        };
-
-        if (!$src) {
-            $raw = @file_get_contents($sourcePath);
-            $src = $raw ? @imagecreatefromstring($raw) : null;
-        }
-
-        if (!$src) {
-            throw new RuntimeException('Could not read image resource for animated GIF creation.');
-        }
-
-        $width = imagesx($src);
-        $height = imagesy($src);
-
-        // Limit dimensions to 480px max for fast rendering and optimal file size
-        $maxDim = 480;
-        if ($width > $maxDim || $height > $maxDim) {
-            $ratio = min($maxDim / $width, $maxDim / $height);
-            $targetW = max(50, (int) round($width * $ratio));
-            $targetH = max(50, (int) round($height * $ratio));
-            $scaled = imagecreatetruecolor($targetW, $targetH);
-            imagealphablending($scaled, false);
-            imagesavealpha($scaled, true);
-            imagecopyresampled($scaled, $src, 0, 0, 0, 0, $targetW, $targetH, $width, $height);
-            imagedestroy($src);
-            $src = $scaled;
-            $width = $targetW;
-            $height = $targetH;
-        }
-
-        // Generate 8 animation frames with smooth sine ease pulse/zoom
-        $frames = [];
-        $numFrames = 8;
-        for ($i = 0; $i < $numFrames; $i++) {
-            $frame = imagecreatetruecolor($width, $height);
-            imagealphablending($frame, false);
-            imagesavealpha($frame, true);
-
-            // Sine wave produces a gentle 0 -> 1 -> 0 looping pulse
-            $progress = sin(($i / $numFrames) * M_PI);
-            $scale = 1.0 + (0.08 * $progress);
-
-            $cropW = (int) round($width / $scale);
-            $cropH = (int) round($height / $scale);
-            $cropX = (int) round(($width - $cropW) / 2);
-            $cropY = (int) round(($height - $cropH) / 2);
-
-            imagecopyresampled($frame, $src, 0, 0, $cropX, $cropY, $width, $height, $cropW, $cropH);
-
-            // Quantize to 256-color palette for standard GIF format
-            imagetruecolortopalette($frame, true, 256);
-
-            ob_start();
-            imagegif($frame);
-            $frames[] = ob_get_clean();
-            imagedestroy($frame);
-        }
-        imagedestroy($src);
-
-        return $this->stitchGifFrames($frames, 12);
-    }
-
-    /**
-     * Stitch individual GIF frames into an animated GIF89a stream with Netscape 2.0 loop extension.
-     */
-    protected function stitchGifFrames(array $frames, int $delayCs = 12): string
-    {
-        if (empty($frames)) {
-            return '';
-        }
-        if (count($frames) === 1) {
-            return $frames[0];
-        }
-
-        $first = $frames[0];
-        $header = "GIF89a" . substr($first, 6, 7);
-
-        // Check for Global Color Table
-        $packed = ord($first[10]);
-        $hasGCT = ($packed & 0x80) !== 0;
-        $gct = '';
-        if ($hasGCT) {
-            $gctCount = 2 << ($packed & 0x07);
-            $gct = substr($first, 13, 3 * $gctCount);
-        }
-
-        // Netscape 2.0 Looping Application Extension (loop count 0 = infinite loop)
-        $loopExtension = "\x21\xFF\x0B" . "NETSCAPE2.0" . "\x03\x01\x00\x00\x00";
-        $out = $header . $gct . $loopExtension;
-
-        // Graphic Control Extension (Delay in 1/100ths of a second)
-        $delayLo = chr($delayCs & 0xFF);
-        $delayHi = chr(($delayCs >> 8) & 0xFF);
-        $gce = "\x21\xF9\x04\x00" . $delayLo . $delayHi . "\x00\x00";
-
-        foreach ($frames as $frame) {
-            $len = strlen($frame);
-            $pos = 13;
-            $framePacked = ord($frame[10]);
-            if (($framePacked & 0x80) !== 0) {
-                $pos += 3 * (2 << ($framePacked & 0x07));
-            }
-
-            while ($pos < $len) {
-                $b = $frame[$pos];
-                if ($b === "\x3B") {
-                    break;
-                } elseif ($b === "\x21") {
-                    $extType = ord($frame[$pos + 1]);
-                    if ($extType === 0xF9) {
-                        $pos += 8;
-                    } else {
-                        $pos += 2;
-                        while ($pos < $len && ord($frame[$pos]) > 0) {
-                            $pos += ord($frame[$pos]) + 1;
-                        }
-                        $pos++;
-                    }
-                } elseif ($b === "\x2C") {
-                    $imgDescriptor = substr($frame, $pos, 10);
-                    $pos += 10;
-
-                    $imgPacked = ord($imgDescriptor[9]);
-                    $lct = '';
-                    if (($imgPacked & 0x80) !== 0) {
-                        $lctSize = 3 * (2 << ($imgPacked & 0x07));
-                        $lct = substr($frame, $pos, $lctSize);
-                        $pos += $lctSize;
-                    }
-
-                    $lzwMinCode = $frame[$pos++];
-                    $subBlocks = '';
-                    while ($pos < $len) {
-                        $blockSize = ord($frame[$pos++]);
-                        if ($blockSize === 0) {
-                            $subBlocks .= "\x00";
-                            break;
-                        }
-                        $subBlocks .= chr($blockSize) . substr($frame, $pos, $blockSize);
-                        $pos += $blockSize;
-                    }
-
-                    $out .= $gce . $imgDescriptor . $lct . $lzwMinCode . $subBlocks;
-                    break;
-                } else {
-                    $pos++;
-                }
-            }
-        }
-
-        $out .= "\x3B";
-        return $out;
     }
 
     /**
