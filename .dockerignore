@@ -1,0 +1,11 @@
+.git
+.github
+vendor
+node_modules
+storage/app/file-converter/uploads/*
+storage/app/file-converter/processed/*
+storage/logs/*
+.env
+.env.backup
+.phpunit.result.cache
+tests
