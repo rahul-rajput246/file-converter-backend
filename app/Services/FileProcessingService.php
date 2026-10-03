@@ -740,9 +740,46 @@ class FileProcessingService
     }
 
     /**
-     * Compress an image based on the selected compression level.
+     * Compress a PDF document using Ghostscript pdfwrite.
      *
-     * @param UploadedFile $file
+     * @param string $inputPath
+     * @param string $compressionLevel 'low' | 'medium' | 'high'
+     * @return string Compressed PDF binary
+     */
+    protected function compressPdf(string $inputPath, string $compressionLevel = 'medium'): string
+    {
+        $setting = match ($compressionLevel) {
+            'high' => '/screen',     // Maximum compression (~72 DPI)
+            'low' => '/printer',     // High quality / light compression (~300 DPI)
+            default => '/ebook',     // Balanced compression (~150 DPI)
+        };
+
+        if ($this->hasCommand('gs')) {
+            $tempOut = tempnam(sys_get_temp_dir(), 'pdf_cmp_') . '.pdf';
+            $inputEscaped = escapeshellarg($inputPath);
+            $outEscaped = escapeshellarg($tempOut);
+            $timeoutPrefix = (DIRECTORY_SEPARATOR !== '\\' && $this->hasCommand('timeout')) ? 'timeout 30 ' : '';
+
+            $cmd = "{$timeoutPrefix}gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS={$setting} -dNOPAUSE -dQUIET -dBATCH -sOutputFile={$outEscaped} {$inputEscaped} 2>&1";
+            $output = [];
+            $code = 0;
+            @exec($cmd, $output, $code);
+
+            if (file_exists($tempOut) && filesize($tempOut) > 0) {
+                $compressed = (string) file_get_contents($tempOut);
+                @unlink($tempOut);
+                return $compressed;
+            }
+            @unlink($tempOut);
+        }
+
+        // Fallback: return original PDF binary
+        return (string) file_get_contents($inputPath);
+    }
+
+    /**
+     * Compress an image or document based on the selected compression level.
+     *
      * @param UploadedFile $file
      * @param string|null $compressionLevel 'low' | 'medium' | 'high'
      * @param float|null $targetSizeKb Desired maximum output size in KB
@@ -761,12 +798,29 @@ class FileProcessingService
 
         $originalSize = (int) $file->getSize();
         $realPath = $file->getRealPath();
+        $mime = (string) $file->getMimeType();
+        $clientExt = strtolower($file->getClientOriginalExtension() ?: '');
+
+        // 0. PDF COMPRESSION PATH using Ghostscript pdfwrite
+        if ($clientExt === 'pdf' || str_contains($mime, 'pdf')) {
+            $sourcePath = ($realPath && file_exists($realPath)) ? $realPath : $file->getPathname();
+            $compressedData = $this->compressPdf($sourcePath, $compressionLevel ?? 'medium');
+            $outputFilename = $this->generateUniqueFilename('compressed', 'pdf');
+            $this->storeProcessedFile($outputFilename, $compressedData);
+
+            return [
+                'filename' => $outputFilename,
+                'original_size' => $originalSize,
+                'processed_size' => strlen($compressedData),
+                'target_size' => null,
+                'compression_level' => $compressionLevel ?? 'medium',
+                'format' => 'pdf',
+            ];
+        }
 
         // 1. FAST PATH: Direct GD compression if no complex target size search is requested (< 25ms)
         if ((!$targetSizeKb || $targetSizeKb <= 0) && $realPath && file_exists($realPath)) {
             @ini_set('memory_limit', '512M');
-            $mime = (string) $file->getMimeType();
-            $clientExt = strtolower($file->getClientOriginalExtension() ?: '');
             $format = match (true) {
                 str_contains($mime, 'webp') || $clientExt === 'webp' => 'webp',
                 str_contains($mime, 'png') || $clientExt === 'png' => 'png',
