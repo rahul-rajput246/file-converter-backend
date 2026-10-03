@@ -112,30 +112,35 @@ class FileProcessingService
         $w = imagesx($gd);
         $h = imagesy($gd);
 
-        // Alpha channel handling
-        if ($targetFormat === 'jpg' || $targetFormat === 'jpeg') {
+        // Alpha channel handling: only flatten transparent images onto white when saving to JPG
+        $isJpgTarget = ($targetFormat === 'jpg' || $targetFormat === 'jpeg');
+        $isSourceTransparent = in_array($ext, ['png', 'webp', 'gif'], true) || str_contains($clientMime ?? '', 'png') || str_contains($clientMime ?? '', 'webp');
+
+        if ($isJpgTarget && $isSourceTransparent) {
             $canvas = imagecreatetruecolor($w, $h);
             $white = imagecolorallocate($canvas, 255, 255, 255);
             imagefilledrectangle($canvas, 0, 0, $w, $h, $white);
             imagecopy($canvas, $gd, 0, 0, 0, 0, $w, $h);
             imagedestroy($gd);
             $gd = $canvas;
-        } else {
+        } elseif (!$isJpgTarget) {
             imagealphablending($gd, false);
             imagesavealpha($gd, true);
         }
+
+        @imageinterlace($gd, false);
 
         ob_start();
         switch ($targetFormat) {
             case 'jpg':
             case 'jpeg':
-                imagejpeg($gd, null, 88);
+                imagejpeg($gd, null, 80);
                 break;
             case 'webp':
-                imagewebp($gd, null, 85);
+                imagewebp($gd, null, 75);
                 break;
             case 'png':
-                imagepng($gd, null, 6);
+                imagepng($gd, null, 2);
                 break;
             case 'gif':
                 imagegif($gd, null);
@@ -727,7 +732,8 @@ class FileProcessingService
 
         // 1. FAST PATH: Direct GD compression if no complex target size search is requested (< 25ms)
         if ((!$targetSizeKb || $targetSizeKb <= 0) && $realPath && file_exists($realPath)) {
-            $mime = $file->getMimeType();
+            @ini_set('memory_limit', '512M');
+            $mime = (string) $file->getMimeType();
             $clientExt = strtolower($file->getClientOriginalExtension() ?: '');
             $format = match (true) {
                 str_contains($mime, 'webp') || $clientExt === 'webp' => 'webp',
@@ -740,7 +746,12 @@ class FileProcessingService
 
             if ($format === 'jpg') {
                 $gd = @imagecreatefromjpeg($realPath);
+                if (!$gd) {
+                    $raw = @file_get_contents($realPath);
+                    $gd = $raw ? @imagecreatefromstring($raw) : null;
+                }
                 if ($gd) {
+                    @imageinterlace($gd, false);
                     ob_start();
                     imagejpeg($gd, null, $quality);
                     $fastData = ob_get_clean();
@@ -748,6 +759,10 @@ class FileProcessingService
                 }
             } elseif ($format === 'webp') {
                 $gd = @imagecreatefromwebp($realPath);
+                if (!$gd) {
+                    $raw = @file_get_contents($realPath);
+                    $gd = $raw ? @imagecreatefromstring($raw) : null;
+                }
                 if ($gd) {
                     ob_start();
                     imagewebp($gd, null, $quality);
@@ -756,13 +771,17 @@ class FileProcessingService
                 }
             } elseif ($format === 'png') {
                 $gd = @imagecreatefrompng($realPath);
+                if (!$gd) {
+                    $raw = @file_get_contents($realPath);
+                    $gd = $raw ? @imagecreatefromstring($raw) : null;
+                }
                 if ($gd) {
                     imagealphablending($gd, false);
                     imagesavealpha($gd, true);
                     $zlib = match ($compressionLevel) {
-                        'low' => 4,
-                        'high' => 8,
-                        default => 6,
+                        'low' => 1,
+                        'high' => 4,
+                        default => 2,
                     };
                     ob_start();
                     imagepng($gd, null, $zlib);

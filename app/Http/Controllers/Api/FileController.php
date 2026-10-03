@@ -8,6 +8,7 @@ use App\Http\Requests\CompressFileRequest;
 use App\Http\Requests\BatchConvertRequest;
 use App\Http\Requests\BatchCompressRequest;
 use App\Services\FileProcessingService;
+use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\Log;
 use Symfony\Component\HttpFoundation\BinaryFileResponse;
@@ -214,6 +215,65 @@ class FileController extends Controller
             return response()->json([
                 'success' => false,
                 'message' => $e->getMessage() ?: 'Unable to compress files.',
+            ], 500);
+        }
+    }
+
+    /**
+     * POST /api/files/create-zip
+     * Create a ZIP archive from existing converted filenames for 1-click batch download.
+     */
+    public function createZip(Request $request): JsonResponse
+    {
+        try {
+            $items = $request->input('files', []);
+            if (empty($items) || !is_array($items)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'No files specified for archive creation.',
+                ], 422);
+            }
+
+            $zipItems = [];
+            foreach ($items as $item) {
+                if (is_string($item)) {
+                    $zipItems[] = [
+                        'filename' => $item,
+                        'zip_entry_name' => basename($item),
+                    ];
+                } elseif (is_array($item) && !empty($item['filename'])) {
+                    $zipItems[] = [
+                        'filename' => $item['filename'],
+                        'zip_entry_name' => $item['original_name'] ?? basename($item['filename']),
+                    ];
+                }
+            }
+
+            $zipFilename = $this->fileProcessingService->createZipArchive($zipItems);
+
+            if (!$zipFilename) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Unable to create zip bundle.',
+                ], 500);
+            }
+
+            $isSecure = $request->isSecure() || $request->header('x-forwarded-proto') === 'https' || app()->environment('production');
+            $downloadUrl = $isSecure 
+                ? secure_url("/api/files/download/{$zipFilename}") 
+                : url("/api/files/download/{$zipFilename}");
+
+            return response()->json([
+                'success' => true,
+                'zip_filename' => $zipFilename,
+                'download_url' => $downloadUrl,
+            ], 200);
+        } catch (Throwable $e) {
+            Log::error('Create Zip API Failure', ['error' => $e->getMessage()]);
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to generate ZIP archive.',
             ], 500);
         }
     }

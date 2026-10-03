@@ -17,6 +17,7 @@ Route::prefix('files')->group(function () {
     Route::post('/batch-convert', [FileController::class, 'batchConvert'])->name('files.batch-convert');
     Route::post('/compress', [FileController::class, 'compress'])->name('files.compress');
     Route::post('/batch-compress', [FileController::class, 'batchCompress'])->name('files.batch-compress');
+    Route::post('/create-zip', [FileController::class, 'createZip'])->name('files.create-zip');
     Route::get('/download/{filename}', [FileController::class, 'download'])->name('files.download');
     Route::get('/supported-formats', [FileController::class, 'supportedFormats'])->name('files.supported-formats');
 });
