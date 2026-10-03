@@ -254,8 +254,10 @@ class FileController extends Controller
             if (!$zipFilename) {
                 return response()->json([
                     'success' => false,
-                    'message' => 'Unable to create zip bundle.',
-                ], 500);
+                    'message' => 'ZIP bundle unavailable on server.',
+                    'zip_filename' => null,
+                    'download_url' => null,
+                ], 200);
             }
 
             $isSecure = $request->isSecure() || $request->header('x-forwarded-proto') === 'https' || app()->environment('production');
@@ -273,8 +275,10 @@ class FileController extends Controller
 
             return response()->json([
                 'success' => false,
-                'message' => 'Failed to generate ZIP archive.',
-            ], 500);
+                'message' => 'ZIP archive could not be generated.',
+                'zip_filename' => null,
+                'download_url' => null,
+            ], 200);
         }
     }
 

@@ -424,7 +424,7 @@ class FileProcessingService
      */
     public function createZipArchive(array $zipItems): ?string
     {
-        if (empty($zipItems) || !class_exists('ZipArchive')) {
+        if (empty($zipItems)) {
             return null;
         }
 
@@ -437,30 +437,60 @@ class FileProcessingService
             @mkdir($dir, 0755, true);
         }
 
-        $zip = new \ZipArchive();
-        if ($zip->open($zipFullPath, \ZipArchive::CREATE | \ZipArchive::OVERWRITE) !== true) {
-            return null;
-        }
-
-        $usedNames = [];
-        foreach ($zipItems as $item) {
-            $filePath = $this->disk()->path($processedDir . '/' . $item['filename']);
-            if (file_exists($filePath)) {
-                $entryName = $item['zip_entry_name'] ?? basename($item['filename']);
-                if (isset($usedNames[$entryName])) {
-                    $usedNames[$entryName]++;
-                    $p = pathinfo($entryName);
-                    $entryName = $p['filename'] . '_' . $usedNames[$entryName] . '.' . ($p['extension'] ?? '');
-                } else {
-                    $usedNames[$entryName] = 1;
+        // Method 1: Native PHP ZipArchive
+        if (class_exists('ZipArchive')) {
+            $zip = new \ZipArchive();
+            if ($zip->open($zipFullPath, \ZipArchive::CREATE | \ZipArchive::OVERWRITE) === true) {
+                $usedNames = [];
+                $addedCount = 0;
+                foreach ($zipItems as $item) {
+                    $filePath = $this->disk()->path($processedDir . '/' . $item['filename']);
+                    if (file_exists($filePath)) {
+                        $entryName = $item['zip_entry_name'] ?? basename($item['filename']);
+                        if (isset($usedNames[$entryName])) {
+                            $usedNames[$entryName]++;
+                            $p = pathinfo($entryName);
+                            $entryName = $p['filename'] . '_' . $usedNames[$entryName] . '.' . ($p['extension'] ?? '');
+                        } else {
+                            $usedNames[$entryName] = 1;
+                        }
+                        $zip->addFile($filePath, $entryName);
+                        $addedCount++;
+                    }
                 }
-                $zip->addFile($filePath, $entryName);
+                $zip->close();
+
+                if ($addedCount > 0 && file_exists($zipFullPath) && filesize($zipFullPath) > 0) {
+                    return $zipFilename;
+                }
             }
         }
 
-        $zip->close();
+        // Method 2: System 'zip' CLI utility fallback (available in Linux/Debian/Render containers)
+        if ($this->hasCommand('zip')) {
+            $fileList = [];
+            foreach ($zipItems as $item) {
+                $filePath = $this->disk()->path($processedDir . '/' . $item['filename']);
+                if (file_exists($filePath)) {
+                    $fileList[] = escapeshellarg($filePath);
+                }
+            }
 
-        return file_exists($zipFullPath) ? $zipFilename : null;
+            if (!empty($fileList)) {
+                $filesStr = implode(' ', $fileList);
+                $zipTargetEscaped = escapeshellarg($zipFullPath);
+                $cmd = "zip -j {$zipTargetEscaped} {$filesStr} 2>&1";
+                $output = [];
+                $code = 0;
+                @exec($cmd, $output, $code);
+
+                if (file_exists($zipFullPath) && filesize($zipFullPath) > 0) {
+                    return $zipFilename;
+                }
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -543,13 +573,15 @@ class FileProcessingService
         $inputEscaped = escapeshellarg($inputPath);
         $renderedFile = null;
 
-        // Case 2: Primary native renderer: pdftoppm (poppler-utils) - ultra crisp 150 DPI
+        $timeoutPrefix = (DIRECTORY_SEPARATOR !== '\\' && $this->hasCommand('timeout')) ? 'timeout 25 ' : '';
+
+        // Case 2: Primary native renderer: pdftoppm (poppler-utils) - ultra crisp 120 DPI
         if ($this->hasCommand('pdftoppm')) {
             $isJpgTarget = ($targetFormat === 'jpg' || $targetFormat === 'jpeg');
-            $formatFlag = $isJpgTarget ? '-jpeg -jpegopt quality=90' : '-png';
+            $formatFlag = $isJpgTarget ? '-jpeg -jpegopt quality=85' : '-png';
             $extSearch = $isJpgTarget ? 'jpg' : 'png';
 
-            $cmd = "pdftoppm {$formatFlag} -r 130 -scale-to-x 1920 -scale-to-y -1 -f 1 -l 1 {$inputEscaped} " . escapeshellarg($prefix) . " 2>&1";
+            $cmd = "{$timeoutPrefix}pdftoppm {$formatFlag} -r 120 -f 1 -l 1 {$inputEscaped} " . escapeshellarg($prefix) . " 2>&1";
             $output = [];
             $code = 0;
             @exec($cmd, $output, $code);
@@ -567,7 +599,7 @@ class FileProcessingService
             $ext = $isJpgTarget ? 'jpg' : 'png';
             $outPath = $prefix . "-1.{$ext}";
             $outEscaped = escapeshellarg($outPath);
-            $cmd = "gs -dNOPAUSE -dBATCH -sDEVICE={$device} -r150 -dFirstPage=1 -dLastPage=1 -sOutputFile={$outEscaped} {$inputEscaped} 2>&1";
+            $cmd = "{$timeoutPrefix}gs -dNOPAUSE -dBATCH -dSAFER -sDEVICE={$device} -r120 -dFirstPage=1 -dLastPage=1 -sOutputFile={$outEscaped} {$inputEscaped} 2>&1";
             $output = [];
             $code = 0;
             @exec($cmd, $output, $code);
