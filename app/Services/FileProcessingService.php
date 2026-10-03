@@ -70,6 +70,87 @@ class FileProcessingService
     }
 
     /**
+     * Blazing fast raster image conversion using direct native GD.
+     * Bypasses heavy framework layers for standard formats (JPG, PNG, WEBP, GIF, BMP).
+     */
+    protected function convertRasterImageFast(string $inputPath, string $targetFormat, ?string $clientExt = null, ?string $clientMime = null): ?string
+    {
+        $ext = strtolower($clientExt ?: pathinfo($inputPath, PATHINFO_EXTENSION));
+        $targetFormat = strtolower($targetFormat);
+
+        $nativeTargets = ['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp'];
+        if (!in_array($targetFormat, $nativeTargets, true)) {
+            return null;
+        }
+
+        $gd = null;
+
+        // Fast load based on extension or mime
+        if ($ext === 'jpg' || $ext === 'jpeg' || str_contains($clientMime ?? '', 'jpeg')) {
+            $gd = @imagecreatefromjpeg($inputPath);
+        } elseif ($ext === 'png' || str_contains($clientMime ?? '', 'png')) {
+            $gd = @imagecreatefrompng($inputPath);
+        } elseif ($ext === 'webp' || str_contains($clientMime ?? '', 'webp')) {
+            $gd = @imagecreatefromwebp($inputPath);
+        } elseif ($ext === 'gif' || str_contains($clientMime ?? '', 'gif')) {
+            $gd = @imagecreatefromgif($inputPath);
+        } elseif ($ext === 'bmp' || str_contains($clientMime ?? '', 'bmp')) {
+            $gd = @imagecreatefrombmp($inputPath);
+        }
+
+        if (!$gd) {
+            $raw = @file_get_contents($inputPath);
+            if ($raw) {
+                $gd = @imagecreatefromstring($raw);
+            }
+        }
+
+        if (!$gd) {
+            return null;
+        }
+
+        $w = imagesx($gd);
+        $h = imagesy($gd);
+
+        // Alpha channel handling
+        if ($targetFormat === 'jpg' || $targetFormat === 'jpeg') {
+            $canvas = imagecreatetruecolor($w, $h);
+            $white = imagecolorallocate($canvas, 255, 255, 255);
+            imagefilledrectangle($canvas, 0, 0, $w, $h, $white);
+            imagecopy($canvas, $gd, 0, 0, 0, 0, $w, $h);
+            imagedestroy($gd);
+            $gd = $canvas;
+        } else {
+            imagealphablending($gd, false);
+            imagesavealpha($gd, true);
+        }
+
+        ob_start();
+        switch ($targetFormat) {
+            case 'jpg':
+            case 'jpeg':
+                imagejpeg($gd, null, 88);
+                break;
+            case 'webp':
+                imagewebp($gd, null, 85);
+                break;
+            case 'png':
+                imagepng($gd, null, 6);
+                break;
+            case 'gif':
+                imagegif($gd, null);
+                break;
+            case 'bmp':
+                imagebmp($gd, null, true);
+                break;
+        }
+        $data = ob_get_clean();
+        imagedestroy($gd);
+
+        return ($data !== false && strlen($data) > 0) ? $data : null;
+    }
+
+    /**
      * Convert an image or media file to the requested target format.
      * Supports genuine animated GIF generation from images and videos.
      *
@@ -94,8 +175,24 @@ class FileProcessingService
         $clientExt = strtolower($file->getClientOriginalExtension() ?: '');
         $clientMime = strtolower($file->getMimeType() ?: '');
         $category = $this->getMediaCategory($clientExt, $clientMime);
+        $realPath = $file->getRealPath();
 
-        // 1. Store temporarily in uploads directory
+        // 1. FAST PATH: Direct native GD conversion for common image-to-image formats (< 30ms)
+        if ($category === 'image' && in_array($targetFormat, ['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp'], true) && $realPath && file_exists($realPath)) {
+            $fastData = $this->convertRasterImageFast($realPath, $targetFormat, $clientExt, $clientMime);
+            if ($fastData !== null) {
+                $outputFilename = $this->generateUniqueFilename('converted', $targetFormat);
+                $this->storeProcessedFile($outputFilename, $fastData);
+
+                return [
+                    'filename' => $outputFilename,
+                    'format' => $targetFormat,
+                    'size' => strlen($fastData),
+                ];
+            }
+        }
+
+        // 2. Standard pipeline for PDF, Video, Audio, ICO, AVIF or fallback
         $tempUploadName = $this->generateUniqueFilename('upload', $clientExt ?: 'bin');
         $this->disk()->putFileAs(config('file_converter.storage.uploads', 'uploads'), $file, $tempUploadName);
         $tempRelativePath = config('file_converter.storage.uploads', 'uploads') . '/' . $tempUploadName;
@@ -153,6 +250,212 @@ class FileProcessingService
             // 5. Always clean up temporary upload file
             $this->deleteTemporaryFile($tempRelativePath);
         }
+    }
+
+    /**
+     * Convert multiple uploaded files (up to max batch limit) to target format.
+     * Optionally creates a single ZIP archive containing all converted files.
+     *
+     * @param array<UploadedFile> $files
+     * @param string $targetFormat
+     * @param bool $createZip
+     * @return array
+     */
+    public function convertBatch(array $files, string $targetFormat, bool $createZip = true): array
+    {
+        $maxBatch = (int) config('file_converter.max_batch_files', 10);
+        if (count($files) > $maxBatch) {
+            $files = array_slice($files, 0, $maxBatch);
+        }
+
+        $convertedFiles = [];
+        $zipItems = [];
+
+        foreach ($files as $index => $file) {
+            if (!$file instanceof UploadedFile || !$file->isValid()) {
+                continue;
+            }
+
+            $originalName = $file->getClientOriginalName();
+            $baseName = pathinfo($originalName, PATHINFO_FILENAME);
+
+            try {
+                $result = $this->convertImage($file, $targetFormat);
+
+                $convertedItem = [
+                    'id' => 'item_' . $index . '_' . bin2hex(random_bytes(3)),
+                    'original_name' => $originalName,
+                    'original_size' => (int) $file->getSize(),
+                    'filename' => $result['filename'],
+                    'format' => $result['format'],
+                    'size' => $result['size'],
+                    'success' => true,
+                ];
+
+                $convertedFiles[] = $convertedItem;
+
+                $zipItems[] = [
+                    'filename' => $result['filename'],
+                    'zip_entry_name' => $baseName . '.' . $result['format'],
+                ];
+            } catch (Throwable $e) {
+                Log::warning('Batch conversion item failed', [
+                    'file' => $originalName,
+                    'error' => $e->getMessage(),
+                ]);
+
+                $convertedFiles[] = [
+                    'id' => 'item_' . $index . '_' . bin2hex(random_bytes(3)),
+                    'original_name' => $originalName,
+                    'original_size' => (int) $file->getSize(),
+                    'filename' => null,
+                    'format' => $targetFormat,
+                    'size' => 0,
+                    'success' => false,
+                    'error' => $e->getMessage() ?: 'Conversion failed.',
+                ];
+            }
+        }
+
+        $zipFilename = null;
+        if ($createZip && count($zipItems) > 0 && class_exists('ZipArchive')) {
+            $zipFilename = $this->createZipArchive($zipItems);
+        }
+
+        return [
+            'total' => count($files),
+            'converted_count' => count(array_filter($convertedFiles, fn($f) => $f['success'])),
+            'target_format' => $targetFormat,
+            'files' => $convertedFiles,
+            'zip_filename' => $zipFilename,
+        ];
+    }
+
+    /**
+     * Compress multiple uploaded files (up to max batch limit).
+     * Optionally creates a single ZIP archive containing all compressed files.
+     *
+     * @param array<UploadedFile> $files
+     * @param string|null $compressionLevel
+     * @param float|null $targetSizeKb
+     * @param bool $createZip
+     * @return array
+     */
+    public function compressBatch(array $files, ?string $compressionLevel = null, ?float $targetSizeKb = null, bool $createZip = true): array
+    {
+        $maxBatch = (int) config('file_converter.max_batch_files', 10);
+        if (count($files) > $maxBatch) {
+            $files = array_slice($files, 0, $maxBatch);
+        }
+
+        $compressedFiles = [];
+        $zipItems = [];
+
+        foreach ($files as $index => $file) {
+            if (!$file instanceof UploadedFile || !$file->isValid()) {
+                continue;
+            }
+
+            $originalName = $file->getClientOriginalName();
+            $baseName = pathinfo($originalName, PATHINFO_FILENAME);
+
+            try {
+                $result = $this->compressImage($file, $compressionLevel, $targetSizeKb);
+
+                $compressedItem = [
+                    'id' => 'item_' . $index . '_' . bin2hex(random_bytes(3)),
+                    'original_name' => $originalName,
+                    'original_size' => $result['original_size'],
+                    'processed_size' => $result['processed_size'],
+                    'filename' => $result['filename'],
+                    'format' => $result['format'],
+                    'compression_level' => $result['compression_level'],
+                    'success' => true,
+                ];
+
+                $compressedFiles[] = $compressedItem;
+
+                $zipItems[] = [
+                    'filename' => $result['filename'],
+                    'zip_entry_name' => $baseName . '_compressed.' . $result['format'],
+                ];
+            } catch (Throwable $e) {
+                Log::warning('Batch compression item failed', [
+                    'file' => $originalName,
+                    'error' => $e->getMessage(),
+                ]);
+
+                $compressedFiles[] = [
+                    'id' => 'item_' . $index . '_' . bin2hex(random_bytes(3)),
+                    'original_name' => $originalName,
+                    'original_size' => (int) $file->getSize(),
+                    'processed_size' => 0,
+                    'filename' => null,
+                    'format' => null,
+                    'success' => false,
+                    'error' => $e->getMessage() ?: 'Compression failed.',
+                ];
+            }
+        }
+
+        $zipFilename = null;
+        if ($createZip && count($zipItems) > 0 && class_exists('ZipArchive')) {
+            $zipFilename = $this->createZipArchive($zipItems);
+        }
+
+        return [
+            'total' => count($files),
+            'processed_count' => count(array_filter($compressedFiles, fn($f) => $f['success'])),
+            'files' => $compressedFiles,
+            'zip_filename' => $zipFilename,
+        ];
+    }
+
+    /**
+     * Create a ZIP archive from a list of processed files.
+     *
+     * @param array $zipItems Array of ['filename' => ..., 'zip_entry_name' => ...]
+     * @return string|null ZIP filename or null on failure
+     */
+    public function createZipArchive(array $zipItems): ?string
+    {
+        if (empty($zipItems) || !class_exists('ZipArchive')) {
+            return null;
+        }
+
+        $zipFilename = $this->generateUniqueFilename('batch', 'zip');
+        $processedDir = config('file_converter.storage.processed', 'processed');
+        $zipFullPath = $this->disk()->path($processedDir . '/' . $zipFilename);
+
+        $dir = dirname($zipFullPath);
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0755, true);
+        }
+
+        $zip = new \ZipArchive();
+        if ($zip->open($zipFullPath, \ZipArchive::CREATE | \ZipArchive::OVERWRITE) !== true) {
+            return null;
+        }
+
+        $usedNames = [];
+        foreach ($zipItems as $item) {
+            $filePath = $this->disk()->path($processedDir . '/' . $item['filename']);
+            if (file_exists($filePath)) {
+                $entryName = $item['zip_entry_name'] ?? basename($item['filename']);
+                if (isset($usedNames[$entryName])) {
+                    $usedNames[$entryName]++;
+                    $p = pathinfo($entryName);
+                    $entryName = $p['filename'] . '_' . $usedNames[$entryName] . '.' . ($p['extension'] ?? '');
+                } else {
+                    $usedNames[$entryName] = 1;
+                }
+                $zip->addFile($filePath, $entryName);
+            }
+        }
+
+        $zip->close();
+
+        return file_exists($zipFullPath) ? $zipFilename : null;
     }
 
     /**
@@ -420,8 +723,70 @@ class FileProcessingService
         }
 
         $originalSize = (int) $file->getSize();
+        $realPath = $file->getRealPath();
 
-        // 1. Store temporarily in uploads directory
+        // 1. FAST PATH: Direct GD compression if no complex target size search is requested (< 25ms)
+        if ((!$targetSizeKb || $targetSizeKb <= 0) && $realPath && file_exists($realPath)) {
+            $mime = $file->getMimeType();
+            $clientExt = strtolower($file->getClientOriginalExtension() ?: '');
+            $format = match (true) {
+                str_contains($mime, 'webp') || $clientExt === 'webp' => 'webp',
+                str_contains($mime, 'png') || $clientExt === 'png' => 'png',
+                default => 'jpg',
+            };
+
+            $quality = (int) ($levels[$compressionLevel]['quality'] ?? 50);
+            $fastData = null;
+
+            if ($format === 'jpg') {
+                $gd = @imagecreatefromjpeg($realPath);
+                if ($gd) {
+                    ob_start();
+                    imagejpeg($gd, null, $quality);
+                    $fastData = ob_get_clean();
+                    imagedestroy($gd);
+                }
+            } elseif ($format === 'webp') {
+                $gd = @imagecreatefromwebp($realPath);
+                if ($gd) {
+                    ob_start();
+                    imagewebp($gd, null, $quality);
+                    $fastData = ob_get_clean();
+                    imagedestroy($gd);
+                }
+            } elseif ($format === 'png') {
+                $gd = @imagecreatefrompng($realPath);
+                if ($gd) {
+                    imagealphablending($gd, false);
+                    imagesavealpha($gd, true);
+                    $zlib = match ($compressionLevel) {
+                        'low' => 4,
+                        'high' => 8,
+                        default => 6,
+                    };
+                    ob_start();
+                    imagepng($gd, null, $zlib);
+                    $fastData = ob_get_clean();
+                    imagedestroy($gd);
+                }
+            }
+
+            if ($fastData !== null && strlen($fastData) > 0) {
+                $outputFilename = $this->generateUniqueFilename('compressed', $format);
+                $this->storeProcessedFile($outputFilename, $fastData);
+
+                return [
+                    'filename' => $outputFilename,
+                    'original_size' => $originalSize,
+                    'processed_size' => strlen($fastData),
+                    'target_size' => null,
+                    'compression_level' => $compressionLevel ?? 'medium',
+                    'format' => $format,
+                ];
+            }
+        }
+
+        // 2. Store temporarily in uploads directory for fallback or target-size search
         $tempUploadName = $this->generateUniqueFilename('upload', $file->getClientOriginalExtension() ?: 'bin');
         $this->disk()->putFileAs(config('file_converter.storage.uploads', 'uploads'), $file, $tempUploadName);
         $tempRelativePath = config('file_converter.storage.uploads', 'uploads') . '/' . $tempUploadName;
@@ -1133,8 +1498,8 @@ class FileProcessingService
             return null;
         }
 
-        // 1. Strict regex check on generated format: (converted|compressed)_{hex}.{ext}
-        if (!preg_match('/^(converted|compressed)_[a-f0-9]{12,64}\.(jpg|jpeg|png|webp|gif|avif|bmp|ico|pdf|mp4|webm|mov|avi|mkv|mp3|wav|ogg|aac)$/i', $filename)) {
+        // 1. Strict regex check on generated format: (converted|compressed|batch)_{hex}.{ext}
+        if (!preg_match('/^(converted|compressed|batch)_[a-f0-9]{8,64}\.(jpg|jpeg|png|webp|gif|avif|bmp|ico|pdf|zip|mp4|webm|mov|avi|mkv|mp3|wav|ogg|aac)$/i', $filename)) {
             return null;
         }
 

@@ -14,7 +14,9 @@ use Illuminate\Support\Facades\Route;
 
 Route::prefix('files')->group(function () {
     Route::post('/convert', [FileController::class, 'convert'])->name('files.convert');
+    Route::post('/batch-convert', [FileController::class, 'batchConvert'])->name('files.batch-convert');
     Route::post('/compress', [FileController::class, 'compress'])->name('files.compress');
+    Route::post('/batch-compress', [FileController::class, 'batchCompress'])->name('files.batch-compress');
     Route::get('/download/{filename}', [FileController::class, 'download'])->name('files.download');
     Route::get('/supported-formats', [FileController::class, 'supportedFormats'])->name('files.supported-formats');
 });
