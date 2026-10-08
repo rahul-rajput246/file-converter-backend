@@ -128,16 +128,16 @@ return [
 
     'compression_levels' => [
         'low' => [
-            'quality' => 65,
-            'description' => 'Light compression, maximum visual fidelity',
+            'quality' => 88,
+            'description' => 'Light compression, near-lossless crystal clear fidelity',
         ],
         'medium' => [
-            'quality' => 45,
-            'description' => 'Balanced compression, good size reduction',
+            'quality' => 80,
+            'description' => 'Balanced compression, crisp and sharp with optimal size reduction',
         ],
         'high' => [
-            'quality' => 25,
-            'description' => 'Aggressive compression, maximum size reduction',
+            'quality' => 70,
+            'description' => 'Maximum compression, strong size reduction while maintaining sharpness',
         ],
     ],
 

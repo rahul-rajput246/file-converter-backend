@@ -507,6 +507,40 @@ class FileConverterApiTest extends TestCase
         $processedSize = $response->json('processed_size');
         // Assert processed size is <= 20 KB (with a small 5% buffer if needed)
         $this->assertLessThanOrEqual(20 * 1024 * 1.05, $processedSize);
+
+        $filename = $response->json('filename');
+        $processedPath = Storage::disk('file_converter')->path('processed/' . $filename);
+        $size = getimagesize($processedPath);
+        $this->assertEquals(400, $size[0], 'Target-size compression must retain 400px width');
+        $this->assertEquals(400, $size[1], 'Target-size compression must retain 400px height');
+    }
+
+    public function test_compression_preserves_original_dimensions_without_downscaling_or_blurring(): void
+    {
+        $tempPath = tempnam(sys_get_temp_dir(), 'test_dim') . '.jpg';
+        $gd = imagecreatetruecolor(250, 180);
+        $color = imagecolorallocate($gd, 120, 200, 80);
+        imagefill($gd, 0, 0, $color);
+        imagejpeg($gd, $tempPath, 90);
+        imagedestroy($gd);
+
+        $file = new UploadedFile($tempPath, 'dim_test.jpg', 'image/jpeg', null, true);
+
+        $response = $this->postJson('/api/files/compress', [
+            'file' => $file,
+            'compression_level' => 'high',
+        ]);
+
+        @unlink($tempPath);
+
+        $response->assertStatus(200);
+        $filename = $response->json('filename');
+        $processedPath = Storage::disk('file_converter')->path('processed/' . $filename);
+        $this->assertFileExists($processedPath);
+
+        $size = getimagesize($processedPath);
+        $this->assertEquals(250, $size[0], 'Width must match original 250px without downscaling');
+        $this->assertEquals(180, $size[1], 'Height must match original 180px without downscaling');
     }
 
     /**
