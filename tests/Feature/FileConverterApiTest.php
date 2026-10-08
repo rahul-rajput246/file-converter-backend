@@ -338,6 +338,103 @@ class FileConverterApiTest extends TestCase
         Storage::disk('file_converter')->assertExists('processed/' . $filename);
     }
 
+    public function test_can_compress_gif_and_preserves_gif_format(): void
+    {
+        // Create an uncompressed sample GIF
+        $tempPath = tempnam(sys_get_temp_dir(), 'test_gif') . '.gif';
+        $gd = imagecreatetruecolor(80, 80);
+        $color = imagecolorallocate($gd, 255, 100, 50);
+        imagefill($gd, 0, 0, $color);
+        imagegif($gd, $tempPath);
+        imagedestroy($gd);
+
+        $file = new UploadedFile($tempPath, 'animation.gif', 'image/gif', null, true);
+
+        $response = $this->postJson('/api/files/compress', [
+            'file' => $file,
+            'compression_level' => 'medium',
+        ]);
+
+        @unlink($tempPath);
+
+        $response->assertStatus(200)
+            ->assertJson([
+                'success' => true,
+                'message' => 'File compressed successfully.',
+                'format' => 'gif',
+            ]);
+
+        $filename = $response->json('filename');
+        $this->assertStringStartsWith('compressed_', $filename);
+        $this->assertStringEndsWith('.gif', $filename);
+        $this->assertStringNotContainsString('.jpg', $filename);
+        Storage::disk('file_converter')->assertExists('processed/' . $filename);
+    }
+
+    public function test_can_compress_bmp_and_preserves_bmp_format(): void
+    {
+        $tempPath = tempnam(sys_get_temp_dir(), 'test_bmp') . '.bmp';
+        $gd = imagecreatetruecolor(60, 60);
+        $color = imagecolorallocate($gd, 10, 150, 200);
+        imagefill($gd, 0, 0, $color);
+        imagebmp($gd, $tempPath);
+        imagedestroy($gd);
+
+        $file = new UploadedFile($tempPath, 'graphic.bmp', 'image/bmp', null, true);
+
+        $response = $this->postJson('/api/files/compress', [
+            'file' => $file,
+            'compression_level' => 'medium',
+        ]);
+
+        @unlink($tempPath);
+
+        $response->assertStatus(200)
+            ->assertJson([
+                'success' => true,
+                'message' => 'File compressed successfully.',
+                'format' => 'bmp',
+            ]);
+
+        $filename = $response->json('filename');
+        $this->assertStringStartsWith('compressed_', $filename);
+        $this->assertStringEndsWith('.bmp', $filename);
+        Storage::disk('file_converter')->assertExists('processed/' . $filename);
+    }
+
+    public function test_batch_compress_preserves_respective_formats(): void
+    {
+        $gifTemp = tempnam(sys_get_temp_dir(), 'batch_gif') . '.gif';
+        $gdGif = imagecreatetruecolor(50, 50);
+        imagefill($gdGif, 0, 0, imagecolorallocate($gdGif, 200, 50, 50));
+        imagegif($gdGif, $gifTemp);
+        imagedestroy($gdGif);
+
+        $gifFile = new UploadedFile($gifTemp, 'sample.gif', 'image/gif', null, true);
+        $pngFile = UploadedFile::fake()->image('sample.png', 50, 50);
+
+        $response = $this->postJson('/api/files/batch-compress', [
+            'files' => [$gifFile, $pngFile],
+            'compression_level' => 'medium',
+        ]);
+
+        @unlink($gifTemp);
+
+        $response->assertStatus(200)
+            ->assertJson([
+                'success' => true,
+                'total' => 2,
+                'processed_count' => 2,
+            ]);
+
+        $files = $response->json('files');
+        $this->assertCount(2, $files);
+        $this->assertEquals('gif', $files[0]['format']);
+        $this->assertStringEndsWith('.gif', $files[0]['filename']);
+        $this->assertEquals('png', $files[1]['format']);
+        $this->assertStringEndsWith('.png', $files[1]['filename']);
+    }
+
     public function test_compression_substantially_reduces_file_size(): void
     {
         // Generate a truecolor image with rich gradient to simulate real photo

@@ -819,14 +819,10 @@ class FileProcessingService
         }
 
         // 1. FAST PATH: Direct GD compression if no complex target size search is requested (< 25ms)
+        $format = $this->detectCompressionFormat($mime, $clientExt);
+
         if ((!$targetSizeKb || $targetSizeKb <= 0) && $realPath && file_exists($realPath)) {
             @ini_set('memory_limit', '512M');
-            $format = match (true) {
-                str_contains($mime, 'webp') || $clientExt === 'webp' => 'webp',
-                str_contains($mime, 'png') || $clientExt === 'png' => 'png',
-                default => 'jpg',
-            };
-
             $quality = (int) ($levels[$compressionLevel]['quality'] ?? 50);
             $fastData = null;
 
@@ -874,6 +870,64 @@ class FileProcessingService
                     $fastData = ob_get_clean();
                     imagedestroy($gd);
                 }
+            } elseif ($format === 'gif') {
+                if ($this->isAnimatedGif($realPath) && $this->hasFfmpeg()) {
+                    $fastData = $this->compressAnimatedGif($realPath, $compressionLevel, null);
+                } else {
+                    $gd = @imagecreatefromgif($realPath);
+                    if (!$gd) {
+                        $raw = @file_get_contents($realPath);
+                        $gd = $raw ? @imagecreatefromstring($raw) : null;
+                    }
+                    if ($gd) {
+                        $colors = match ($compressionLevel) {
+                            'high' => 48,
+                            'low' => 192,
+                            default => 96,
+                        };
+                        if (!imageistruecolor($gd)) {
+                            imagepalettetotruecolor($gd);
+                        }
+                        imagetruecolortopalette($gd, true, $colors);
+                        ob_start();
+                        imagegif($gd, null);
+                        $fastData = ob_get_clean();
+                        imagedestroy($gd);
+                    }
+                }
+            } elseif ($format === 'avif' && function_exists('imageavif')) {
+                $gd = @imagecreatefromavif($realPath);
+                if (!$gd) {
+                    $raw = @file_get_contents($realPath);
+                    $gd = $raw ? @imagecreatefromstring($raw) : null;
+                }
+                if ($gd) {
+                    ob_start();
+                    imageavif($gd, null, $quality);
+                    $fastData = ob_get_clean();
+                    imagedestroy($gd);
+                }
+            } elseif ($format === 'bmp' && function_exists('imagebmp')) {
+                $gd = @imagecreatefrombmp($realPath);
+                if (!$gd) {
+                    $raw = @file_get_contents($realPath);
+                    $gd = $raw ? @imagecreatefromstring($raw) : null;
+                }
+                if ($gd) {
+                    $colors = match ($compressionLevel) {
+                        'high' => 64,
+                        'low' => 256,
+                        default => 128,
+                    };
+                    if (!imageistruecolor($gd)) {
+                        imagepalettetotruecolor($gd);
+                    }
+                    imagetruecolortopalette($gd, true, $colors);
+                    ob_start();
+                    imagebmp($gd, null, true);
+                    $fastData = ob_get_clean();
+                    imagedestroy($gd);
+                }
             }
 
             if ($fastData !== null && strlen($fastData) > 0) {
@@ -898,29 +952,25 @@ class FileProcessingService
         $tempFullPath = $this->disk()->path($tempRelativePath);
 
         try {
-            // 2. Determine native format to retain image format during compression
-            $mime = $file->getMimeType();
-            $clientExt = strtolower($file->getClientOriginalExtension() ?: '');
-
-            $format = match (true) {
-                str_contains($mime, 'webp') || $clientExt === 'webp' => 'webp',
-                str_contains($mime, 'png') || $clientExt === 'png' => 'png',
-                default => 'jpg',
-            };
-
-            // 3. Compress using target size if requested, otherwise by preset level
+            // 2. Compress using target size if requested, otherwise by preset level
             if ($targetSizeKb !== null && $targetSizeKb > 0) {
                 $targetBytes = (int) round($targetSizeKb * 1024);
-                $binaryData = $this->compressToTargetSize($tempFullPath, $format, $targetBytes, $originalSize);
+                $binaryData = $this->compressToTargetSize($tempFullPath, $format, $targetBytes, $originalSize, $compressionLevel);
             } else {
                 $binaryData = match ($format) {
                     'png' => $this->compressPng($tempFullPath, $compressionLevel, $originalSize),
                     'webp' => $this->compressWebp($tempFullPath, $compressionLevel, $originalSize),
+                    'gif' => $this->compressGif($tempFullPath, $compressionLevel, $originalSize),
+                    'avif' => $this->compressAvif($tempFullPath, $compressionLevel, $originalSize),
+                    'bmp' => $this->compressBmp($tempFullPath, $compressionLevel, $originalSize),
+                    'ico' => $this->compressIco($tempFullPath),
+                    'mp4', 'webm', 'mov', 'avi', 'mkv' => $this->compressVideo($tempFullPath, $format, $compressionLevel),
+                    'mp3', 'wav', 'ogg', 'aac' => $this->compressAudio($tempFullPath, $format, $compressionLevel),
                     default => $this->compressJpeg($tempFullPath, $compressionLevel, $originalSize),
                 };
             }
 
-            // 4. Store processed file
+            // 3. Store processed file
             $outputFilename = $this->generateUniqueFilename('compressed', $format);
             $this->storeProcessedFile($outputFilename, $binaryData);
 
@@ -952,13 +1002,20 @@ class FileProcessingService
      * @param string $format
      * @param int $targetBytes
      * @param int $originalSize
+     * @param string|null $compressionLevel
      * @return string
      */
-    protected function compressToTargetSize(string $filePath, string $format, int $targetBytes, int $originalSize): string
+    protected function compressToTargetSize(string $filePath, string $format, int $targetBytes, int $originalSize, ?string $compressionLevel = 'medium'): string
     {
         return match ($format) {
             'png' => $this->compressPngToTarget($filePath, $targetBytes, $originalSize),
             'webp' => $this->compressWebpToTarget($filePath, $targetBytes, $originalSize),
+            'gif' => $this->compressGifToTarget($filePath, $targetBytes, $originalSize),
+            'avif' => $this->compressAvifToTarget($filePath, $targetBytes, $originalSize),
+            'bmp' => $this->compressBmpToTarget($filePath, $targetBytes, $originalSize),
+            'ico' => $this->compressIco($filePath),
+            'mp4', 'webm', 'mov', 'avi', 'mkv' => $this->compressVideoToTarget($filePath, $format, $targetBytes),
+            'mp3', 'wav', 'ogg', 'aac' => $this->compressAudioToTarget($filePath, $format, $targetBytes),
             default => $this->compressJpegToTarget($filePath, $targetBytes, $originalSize),
         };
     }
@@ -1438,6 +1495,733 @@ class FileProcessingService
         imagedestroy($gd);
 
         return $bestData ?? (string) Image::read($filePath)->toWebp(quality: $targetQuality);
+    }
+
+    /**
+     * Accurately determine the native format of a file to preserve its extension and type during compression.
+     */
+    public function detectCompressionFormat(string $mime, string $clientExt): string
+    {
+        $clientExt = strtolower(trim($clientExt));
+        $mime = strtolower(trim($mime));
+
+        // Prioritize explicit client extension when it's a known supported format
+        $extMap = [
+            'gif' => 'gif',
+            'png' => 'png',
+            'jpg' => 'jpg',
+            'jpeg' => 'jpg',
+            'webp' => 'webp',
+            'avif' => 'avif',
+            'bmp' => 'bmp',
+            'ico' => 'ico',
+            'pdf' => 'pdf',
+            'mp4' => 'mp4',
+            'webm' => 'webm',
+            'mov' => 'mov',
+            'avi' => 'avi',
+            'mkv' => 'mkv',
+            'mp3' => 'mp3',
+            'wav' => 'wav',
+            'ogg' => 'ogg',
+            'aac' => 'aac',
+        ];
+
+        if (isset($extMap[$clientExt])) {
+            return $extMap[$clientExt];
+        }
+
+        // Fallback to MIME type detection
+        if (str_contains($mime, 'gif')) {
+            return 'gif';
+        }
+        if (str_contains($mime, 'png')) {
+            return 'png';
+        }
+        if (str_contains($mime, 'webp')) {
+            return 'webp';
+        }
+        if (str_contains($mime, 'avif')) {
+            return 'avif';
+        }
+        if (str_contains($mime, 'bmp')) {
+            return 'bmp';
+        }
+        if (str_contains($mime, 'icon') || str_contains($mime, 'ico')) {
+            return 'ico';
+        }
+        if (str_contains($mime, 'pdf')) {
+            return 'pdf';
+        }
+        if (str_contains($mime, 'jpeg') || str_contains($mime, 'jpg')) {
+            return 'jpg';
+        }
+        if (str_starts_with($mime, 'video/')) {
+            return 'mp4';
+        }
+        if (str_starts_with($mime, 'audio/')) {
+            return 'mp3';
+        }
+
+        return 'jpg';
+    }
+
+    /**
+     * Check if a GIF file is an animated multi-frame GIF.
+     */
+    public function isAnimatedGif(string $filePath): bool
+    {
+        $contents = @file_get_contents($filePath);
+        if (!$contents) {
+            return false;
+        }
+        $count = preg_match_all('#\x00\x21\xF9\x04#', $contents, $matches);
+        return $count > 1;
+    }
+
+    /**
+     * Compress an animated GIF using FFmpeg palette optimization.
+     */
+    protected function compressAnimatedGif(string $inputPath, ?string $compressionLevel, ?int $targetBytes): string
+    {
+        $tempOut = tempnam(sys_get_temp_dir(), 'gif_cmp_') . '.gif';
+        $inputEsc = escapeshellarg($inputPath);
+        $outEsc = escapeshellarg($tempOut);
+
+        $colors = match ($compressionLevel) {
+            'high' => 48,
+            'low' => 192,
+            default => 96,
+        };
+        $fps = match ($compressionLevel) {
+            'high' => 'fps=8,',
+            'low' => '',
+            default => 'fps=12,',
+        };
+
+        $scale = '';
+        if ($targetBytes !== null && $targetBytes > 0) {
+            $origSize = (int) @filesize($inputPath);
+            if ($origSize > $targetBytes) {
+                $ratio = sqrt($targetBytes / max(1, $origSize));
+                if ($ratio < 0.85) {
+                    $scale = "scale='trunc(iw*" . round($ratio, 2) . "/2)*2':-1:flags=lanczos,";
+                    $colors = min(64, $colors);
+                }
+            }
+        }
+
+        $cmd = "ffmpeg -y -i {$inputEsc} -vf \"{$fps}{$scale}split[s0][s1];[s0]palettegen=max_colors={$colors}:stats_mode=diff[p];[s1][p]paletteuse=dither=bayer:bayer_scale=3\" -loop 0 {$outEsc} 2>&1";
+        $output = [];
+        $returnVar = 0;
+        @exec($cmd, $output, $returnVar);
+
+        if ($returnVar === 0 && file_exists($tempOut) && filesize($tempOut) > 0) {
+            $data = file_get_contents($tempOut);
+            @unlink($tempOut);
+            return $data;
+        }
+
+        @unlink($tempOut);
+        return (string) file_get_contents($inputPath);
+    }
+
+    /**
+     * Compress a GIF image using adaptive palette quantization.
+     */
+    protected function compressGif(string $filePath, string $compressionLevel, int $originalSize): string
+    {
+        if ($this->isAnimatedGif($filePath) && $this->hasFfmpeg()) {
+            return $this->compressAnimatedGif($filePath, $compressionLevel, null);
+        }
+
+        $gd = @imagecreatefromgif($filePath);
+        if (!$gd) {
+            $raw = @file_get_contents($filePath);
+            $gd = $raw ? @imagecreatefromstring($raw) : null;
+        }
+
+        if (!$gd) {
+            return (string) file_get_contents($filePath);
+        }
+
+        $colorOptions = match ($compressionLevel) {
+            'low' => [192, 128, 96],
+            'medium' => [128, 64, 48],
+            'high' => [64, 32, 16],
+            default => [128, 64, 32],
+        };
+
+        $bestData = null;
+        $bestSize = PHP_INT_MAX;
+
+        foreach ($colorOptions as $colors) {
+            $testGd = @imagecreatefromgif($filePath);
+            if (!$testGd) {
+                $raw = @file_get_contents($filePath);
+                $testGd = $raw ? @imagecreatefromstring($raw) : null;
+            }
+            if (!$testGd) continue;
+
+            if (!imageistruecolor($testGd)) {
+                imagepalettetotruecolor($testGd);
+            }
+            imagetruecolortopalette($testGd, true, $colors);
+
+            ob_start();
+            imagegif($testGd, null);
+            $data = ob_get_clean();
+            imagedestroy($testGd);
+
+            if ($data !== false && strlen($data) > 0) {
+                $len = strlen($data);
+                if ($len < $bestSize) {
+                    $bestSize = $len;
+                    $bestData = $data;
+                }
+                if ($len < $originalSize) {
+                    imagedestroy($gd);
+                    return $data;
+                }
+            }
+        }
+
+        imagedestroy($gd);
+        return $bestData ?? (string) file_get_contents($filePath);
+    }
+
+    /**
+     * Compress a GIF to achieve a specific target size in bytes.
+     */
+    protected function compressGifToTarget(string $filePath, int $targetBytes, int $originalSize): string
+    {
+        if ($this->isAnimatedGif($filePath) && $this->hasFfmpeg()) {
+            return $this->compressAnimatedGif($filePath, null, $targetBytes);
+        }
+
+        $gd = @imagecreatefromgif($filePath);
+        if (!$gd) {
+            $raw = @file_get_contents($filePath);
+            $gd = $raw ? @imagecreatefromstring($raw) : null;
+        }
+
+        if (!$gd) {
+            return (string) file_get_contents($filePath);
+        }
+
+        $origW = imagesx($gd);
+        $origH = imagesy($gd);
+        $bestData = null;
+        $bestSize = PHP_INT_MAX;
+
+        $colorSteps = [256, 192, 128, 96, 64, 48, 32, 16];
+        foreach ($colorSteps as $colors) {
+            $testGd = @imagecreatefromgif($filePath);
+            if (!$testGd) {
+                $raw = @file_get_contents($filePath);
+                $testGd = $raw ? @imagecreatefromstring($raw) : null;
+            }
+            if (!$testGd) continue;
+
+            if (!imageistruecolor($testGd)) {
+                imagepalettetotruecolor($testGd);
+            }
+            imagetruecolortopalette($testGd, true, $colors);
+
+            ob_start();
+            imagegif($testGd, null);
+            $data = ob_get_clean();
+            imagedestroy($testGd);
+
+            if ($data !== false && strlen($data) > 0) {
+                $len = strlen($data);
+                if ($len < $bestSize) {
+                    $bestSize = $len;
+                    $bestData = $data;
+                }
+                if ($len <= $targetBytes) {
+                    imagedestroy($gd);
+                    return $data;
+                }
+            }
+        }
+
+        // Downscale dimensions if palette reduction alone doesn't hit target size
+        if ($bestSize > $targetBytes && $origW > 60 && $origH > 60) {
+            $scale = sqrt($targetBytes / max(1, $bestSize)) * 0.95;
+            for ($i = 0; $i < 4 && $bestSize > $targetBytes && $scale < 0.95; $i++) {
+                $newW = max(50, (int) ($origW * $scale));
+                $newH = max(50, (int) ($origH * $scale));
+                $scaledGd = imagescale($gd, $newW, $newH);
+
+                if ($scaledGd) {
+                    imagetruecolortopalette($scaledGd, true, 64);
+                    ob_start();
+                    imagegif($scaledGd, null);
+                    $scaledData = ob_get_clean();
+                    imagedestroy($scaledGd);
+
+                    if ($scaledData !== false && strlen($scaledData) > 0) {
+                        $len = strlen($scaledData);
+                        if ($len < $bestSize) {
+                            $bestSize = $len;
+                            $bestData = $scaledData;
+                        }
+                        if ($len <= $targetBytes) {
+                            imagedestroy($gd);
+                            return $bestData;
+                        }
+                    }
+                }
+                $scale *= 0.8;
+            }
+        }
+
+        imagedestroy($gd);
+        return $bestData ?? (string) file_get_contents($filePath);
+    }
+
+    /**
+     * Compress an AVIF image using adaptive quality stepping.
+     */
+    protected function compressAvif(string $filePath, string $compressionLevel, int $originalSize): string
+    {
+        $levels = config('file_converter.compression_levels', []);
+        $targetQuality = (int) ($levels[$compressionLevel]['quality'] ?? 45);
+
+        if (function_exists('imageavif')) {
+            $gd = @imagecreatefromavif($filePath);
+            if (!$gd) {
+                $raw = @file_get_contents($filePath);
+                $gd = $raw ? @imagecreatefromstring($raw) : null;
+            }
+
+            if ($gd) {
+                ob_start();
+                imageavif($gd, null, $targetQuality);
+                $data = ob_get_clean();
+
+                if ($data !== false && strlen($data) < $originalSize) {
+                    imagedestroy($gd);
+                    return $data;
+                }
+
+                $bestData = $data ?: null;
+                $bestSize = $data ? strlen($data) : PHP_INT_MAX;
+
+                $stepDownMin = match ($compressionLevel) {
+                    'high' => 15,
+                    'medium' => 20,
+                    default => 25,
+                };
+
+                for ($q = $targetQuality - 10; $q >= $stepDownMin; $q -= 5) {
+                    ob_start();
+                    imageavif($gd, null, $q);
+                    $candidate = ob_get_clean();
+
+                    if ($candidate !== false && strlen($candidate) > 0) {
+                        $len = strlen($candidate);
+                        if ($len < $bestSize) {
+                            $bestSize = $len;
+                            $bestData = $candidate;
+                        }
+
+                        if ($len < $originalSize) {
+                            imagedestroy($gd);
+                            return $candidate;
+                        }
+                    }
+                }
+
+                imagedestroy($gd);
+                if ($bestData !== null) {
+                    return $bestData;
+                }
+            }
+        }
+
+        return (string) Image::read($filePath)->toAvif(quality: $targetQuality);
+    }
+
+    /**
+     * Compress an AVIF image to achieve a specific target size.
+     */
+    protected function compressAvifToTarget(string $filePath, int $targetBytes, int $originalSize): string
+    {
+        if (function_exists('imageavif')) {
+            $gd = @imagecreatefromavif($filePath);
+            if (!$gd) {
+                $raw = @file_get_contents($filePath);
+                $gd = $raw ? @imagecreatefromstring($raw) : null;
+            }
+
+            if ($gd) {
+                $origW = imagesx($gd);
+                $origH = imagesy($gd);
+                $bestData = null;
+                $bestSize = PHP_INT_MAX;
+
+                // Binary search quality
+                $low = 10;
+                $high = 90;
+                while ($low <= $high) {
+                    $mid = (int) (($low + $high) / 2);
+                    ob_start();
+                    imageavif($gd, null, $mid);
+                    $data = ob_get_clean();
+
+                    if ($data !== false) {
+                        $len = strlen($data);
+                        if ($len <= $targetBytes) {
+                            $bestData = $data;
+                            $bestSize = $len;
+                            $low = $mid + 1;
+                        } else {
+                            $high = $mid - 1;
+                            if ($len < $bestSize) {
+                                $bestSize = $len;
+                                $bestData = $data;
+                            }
+                        }
+                    }
+                }
+
+                // Downscale if still exceeds target
+                if ($bestSize > $targetBytes && $origW > 60 && $origH > 60) {
+                    $currentGd = $gd;
+                    $scale = sqrt($targetBytes / max(1, $bestSize)) * 0.95;
+                    for ($i = 0; $i < 4 && $bestSize > $targetBytes && $scale < 0.95; $i++) {
+                        $newW = max(50, (int) ($origW * $scale));
+                        $newH = max(50, (int) ($origH * $scale));
+                        $scaledGd = imagescale($currentGd, $newW, $newH);
+                        if ($scaledGd) {
+                            ob_start();
+                            imageavif($scaledGd, null, 50);
+                            $scaledData = ob_get_clean();
+                            imagedestroy($scaledGd);
+
+                            if ($scaledData !== false) {
+                                $len = strlen($scaledData);
+                                if ($len < $bestSize) {
+                                    $bestSize = $len;
+                                    $bestData = $scaledData;
+                                }
+                                if ($len <= $targetBytes) {
+                                    break;
+                                }
+                            }
+                        }
+                        $scale *= 0.8;
+                    }
+                }
+
+                imagedestroy($gd);
+                if ($bestData !== null) {
+                    return $bestData;
+                }
+            }
+        }
+
+        return (string) Image::read($filePath)->toAvif(quality: 35);
+    }
+
+    /**
+     * Compress a BMP image using palette quantization and RLE compression.
+     */
+    protected function compressBmp(string $filePath, string $compressionLevel, int $originalSize): string
+    {
+        $gd = @imagecreatefrombmp($filePath);
+        if (!$gd) {
+            $raw = @file_get_contents($filePath);
+            $gd = $raw ? @imagecreatefromstring($raw) : null;
+        }
+
+        if (!$gd) {
+            return (string) Image::read($filePath)->toBmp();
+        }
+
+        $colors = match ($compressionLevel) {
+            'high' => 64,
+            'medium' => 128,
+            default => 256,
+        };
+
+        if (!imageistruecolor($gd)) {
+            imagepalettetotruecolor($gd);
+        }
+        imagetruecolortopalette($gd, true, $colors);
+
+        ob_start();
+        imagebmp($gd, null, true);
+        $data = ob_get_clean();
+        imagedestroy($gd);
+
+        return ($data !== false && strlen($data) > 0) ? $data : (string) Image::read($filePath)->toBmp();
+    }
+
+    /**
+     * Compress a BMP image to achieve a specific target size in bytes.
+     */
+    protected function compressBmpToTarget(string $filePath, int $targetBytes, int $originalSize): string
+    {
+        $gd = @imagecreatefrombmp($filePath);
+        if (!$gd) {
+            $raw = @file_get_contents($filePath);
+            $gd = $raw ? @imagecreatefromstring($raw) : null;
+        }
+
+        if (!$gd) {
+            return (string) Image::read($filePath)->toBmp();
+        }
+
+        $origW = imagesx($gd);
+        $origH = imagesy($gd);
+        $bestData = null;
+        $bestSize = PHP_INT_MAX;
+
+        $colorSteps = [256, 128, 64, 32, 16];
+        foreach ($colorSteps as $colors) {
+            $testGd = @imagecreatefrombmp($filePath);
+            if (!$testGd) {
+                $raw = @file_get_contents($filePath);
+                $testGd = $raw ? @imagecreatefromstring($raw) : null;
+            }
+            if (!$testGd) continue;
+
+            if (!imageistruecolor($testGd)) {
+                imagepalettetotruecolor($testGd);
+            }
+            imagetruecolortopalette($testGd, true, $colors);
+
+            ob_start();
+            imagebmp($testGd, null, true);
+            $data = ob_get_clean();
+            imagedestroy($testGd);
+
+            if ($data !== false && strlen($data) > 0) {
+                $len = strlen($data);
+                if ($len < $bestSize) {
+                    $bestSize = $len;
+                    $bestData = $data;
+                }
+                if ($len <= $targetBytes) {
+                    imagedestroy($gd);
+                    return $data;
+                }
+            }
+        }
+
+        // Downscale dimensions if needed
+        if ($bestSize > $targetBytes && $origW > 60 && $origH > 60) {
+            $scale = sqrt($targetBytes / max(1, $bestSize)) * 0.95;
+            for ($i = 0; $i < 4 && $bestSize > $targetBytes && $scale < 0.95; $i++) {
+                $newW = max(50, (int) ($origW * $scale));
+                $newH = max(50, (int) ($origH * $scale));
+                $scaledGd = imagescale($gd, $newW, $newH);
+
+                if ($scaledGd) {
+                    imagetruecolortopalette($scaledGd, true, 128);
+                    ob_start();
+                    imagebmp($scaledGd, null, true);
+                    $scaledData = ob_get_clean();
+                    imagedestroy($scaledGd);
+
+                    if ($scaledData !== false && strlen($scaledData) > 0) {
+                        $len = strlen($scaledData);
+                        if ($len < $bestSize) {
+                            $bestSize = $len;
+                            $bestData = $scaledData;
+                        }
+                        if ($len <= $targetBytes) {
+                            imagedestroy($gd);
+                            return $bestData;
+                        }
+                    }
+                }
+                $scale *= 0.8;
+            }
+        }
+
+        imagedestroy($gd);
+        return $bestData ?? (string) Image::read($filePath)->toBmp();
+    }
+
+    /**
+     * Compress an ICO file preserving format.
+     */
+    protected function compressIco(string $filePath): string
+    {
+        $image = Image::read($filePath);
+        return $this->transcodeToIco($image);
+    }
+
+    /**
+     * Compress a video using FFmpeg.
+     */
+    protected function compressVideo(string $filePath, string $format, ?string $compressionLevel): string
+    {
+        if (!$this->hasFfmpeg()) {
+            throw new RuntimeException("FFmpeg is required to compress video files. Please ensure FFmpeg is enabled on the server.");
+        }
+
+        $tempOut = tempnam(sys_get_temp_dir(), 'vid_cmp_') . '.' . $format;
+        $inputEsc = escapeshellarg($filePath);
+        $outEsc = escapeshellarg($tempOut);
+
+        $crf = match ($compressionLevel) {
+            'high' => 34,
+            'low' => 23,
+            default => 28,
+        };
+
+        $cmd = ($format === 'webm')
+            ? "ffmpeg -y -i {$inputEsc} -c:v libvpx-vp9 -crf " . ($crf + 5) . " -b:v 0 -c:a libopus {$outEsc} 2>&1"
+            : "ffmpeg -y -i {$inputEsc} -c:v libx264 -crf {$crf} -preset fast -pix_fmt yuv420p -c:a aac -b:a 96k -movflags +faststart {$outEsc} 2>&1";
+
+        $output = [];
+        $returnVar = 0;
+        @exec($cmd, $output, $returnVar);
+
+        if ($returnVar !== 0 || !file_exists($tempOut) || filesize($tempOut) === 0) {
+            @unlink($tempOut);
+            throw new RuntimeException("Video compression failed during processing.");
+        }
+
+        $data = file_get_contents($tempOut);
+        @unlink($tempOut);
+        return $data;
+    }
+
+    /**
+     * Compress a video to target size using FFmpeg.
+     */
+    protected function compressVideoToTarget(string $filePath, string $format, int $targetBytes): string
+    {
+        if (!$this->hasFfmpeg()) {
+            throw new RuntimeException("FFmpeg is required to compress video files. Please ensure FFmpeg is enabled on the server.");
+        }
+
+        $tempOut = tempnam(sys_get_temp_dir(), 'vid_target_') . '.' . $format;
+        $inputEsc = escapeshellarg($filePath);
+        $outEsc = escapeshellarg($tempOut);
+
+        $durationSeconds = 10;
+        $cmdInfo = "ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 {$inputEsc} 2>&1";
+        $infoOut = [];
+        @exec($cmdInfo, $infoOut);
+        if (!empty($infoOut[0]) && is_numeric($infoOut[0])) {
+            $durationSeconds = max(1, (float) $infoOut[0]);
+        }
+
+        $targetTotalKbits = ($targetBytes * 8) / 1024;
+        $totalBitrateKbps = max(50, (int) round($targetTotalKbits / $durationSeconds));
+        $audioBitrate = min(64, max(32, (int) round($totalBitrateKbps * 0.15)));
+        $videoBitrate = max(30, $totalBitrateKbps - $audioBitrate);
+
+        $cmd = ($format === 'webm')
+            ? "ffmpeg -y -i {$inputEsc} -c:v libvpx-vp9 -b:v {$videoBitrate}k -maxrate {$videoBitrate}k -bufsize " . ($videoBitrate * 2) . "k -c:a libopus -b:a {$audioBitrate}k {$outEsc} 2>&1"
+            : "ffmpeg -y -i {$inputEsc} -c:v libx264 -b:v {$videoBitrate}k -maxrate {$videoBitrate}k -bufsize " . ($videoBitrate * 2) . "k -pix_fmt yuv420p -c:a aac -b:a {$audioBitrate}k -movflags +faststart {$outEsc} 2>&1";
+
+        $output = [];
+        $returnVar = 0;
+        @exec($cmd, $output, $returnVar);
+
+        if ($returnVar !== 0 || !file_exists($tempOut) || filesize($tempOut) === 0) {
+            @unlink($tempOut);
+            throw new RuntimeException("Target size video compression failed.");
+        }
+
+        $data = file_get_contents($tempOut);
+        @unlink($tempOut);
+        return $data;
+    }
+
+    /**
+     * Compress an audio file using FFmpeg.
+     */
+    protected function compressAudio(string $filePath, string $format, ?string $compressionLevel): string
+    {
+        if (!$this->hasFfmpeg()) {
+            throw new RuntimeException("FFmpeg is required to compress audio files. Please ensure FFmpeg is enabled on the server.");
+        }
+
+        $tempOut = tempnam(sys_get_temp_dir(), 'aud_cmp_') . '.' . $format;
+        $inputEsc = escapeshellarg($filePath);
+        $outEsc = escapeshellarg($tempOut);
+
+        $bitrate = match ($compressionLevel) {
+            'high' => '64k',
+            'low' => '192k',
+            default => '128k',
+        };
+
+        $codec = match ($format) {
+            'mp3' => "-c:a libmp3lame -b:a {$bitrate}",
+            'ogg' => "-c:a libvorbis -b:a {$bitrate}",
+            'aac' => "-c:a aac -b:a {$bitrate}",
+            'wav' => "-c:a pcm_s16le -ar 22050",
+            default => "-b:a {$bitrate}",
+        };
+
+        $cmd = "ffmpeg -y -i {$inputEsc} -vn {$codec} {$outEsc} 2>&1";
+        $output = [];
+        $returnVar = 0;
+        @exec($cmd, $output, $returnVar);
+
+        if ($returnVar !== 0 || !file_exists($tempOut) || filesize($tempOut) === 0) {
+            @unlink($tempOut);
+            throw new RuntimeException("Audio compression failed during processing.");
+        }
+
+        $data = file_get_contents($tempOut);
+        @unlink($tempOut);
+        return $data;
+    }
+
+    /**
+     * Compress an audio file to target size using FFmpeg.
+     */
+    protected function compressAudioToTarget(string $filePath, string $format, int $targetBytes): string
+    {
+        if (!$this->hasFfmpeg()) {
+            throw new RuntimeException("FFmpeg is required to compress audio files. Please ensure FFmpeg is enabled on the server.");
+        }
+
+        $tempOut = tempnam(sys_get_temp_dir(), 'aud_target_') . '.' . $format;
+        $inputEsc = escapeshellarg($filePath);
+        $outEsc = escapeshellarg($tempOut);
+
+        $durationSeconds = 10;
+        $cmdInfo = "ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 {$inputEsc} 2>&1";
+        $infoOut = [];
+        @exec($cmdInfo, $infoOut);
+        if (!empty($infoOut[0]) && is_numeric($infoOut[0])) {
+            $durationSeconds = max(1, (float) $infoOut[0]);
+        }
+
+        $bitrateKbps = max(32, (int) round(($targetBytes * 8) / 1024 / $durationSeconds));
+
+        $codec = match ($format) {
+            'mp3' => "-c:a libmp3lame -b:a {$bitrateKbps}k",
+            'ogg' => "-c:a libvorbis -b:a {$bitrateKbps}k",
+            'aac' => "-c:a aac -b:a {$bitrateKbps}k",
+            default => "-b:a {$bitrateKbps}k",
+        };
+
+        $cmd = "ffmpeg -y -i {$inputEsc} -vn {$codec} {$outEsc} 2>&1";
+        $output = [];
+        $returnVar = 0;
+        @exec($cmd, $output, $returnVar);
+
+        if ($returnVar !== 0 || !file_exists($tempOut) || filesize($tempOut) === 0) {
+            @unlink($tempOut);
+            throw new RuntimeException("Target size audio compression failed.");
+        }
+
+        $data = file_get_contents($tempOut);
+        @unlink($tempOut);
+        return $data;
     }
 
     /**

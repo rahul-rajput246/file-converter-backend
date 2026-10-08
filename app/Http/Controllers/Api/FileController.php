@@ -150,6 +150,8 @@ class FileController extends Controller
                 'processed_size' => $result['processed_size'],
                 'target_size' => $result['target_size'] ?? null,
                 'filename' => $result['filename'],
+                'format' => $result['format'] ?? null,
+                'compression_level' => $result['compression_level'] ?? $level ?? 'medium',
                 'download_url' => $downloadUrl,
             ], 200);
         } catch (Throwable $e) {

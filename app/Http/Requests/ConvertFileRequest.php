@@ -40,6 +40,11 @@ class ConvertFileRequest extends FormRequest
             'mp4', 'webm', 'mov', 'avi', 'mkv',
             'mp3', 'wav', 'ogg', 'aac', 'txt'
         ]);
+        $supportedInputFormats = array_values(array_filter($supportedFormats, fn($f) => $f !== 'txt'));
+        $supportedInputMimes = array_values(array_filter(
+            config('file_converter.supported_mimes', []),
+            fn($m) => $m !== 'text/plain' && $m !== 'application/octet-stream'
+        ));
         $maxKb = config('file_converter.max_file_size', 102400);
 
         return [
@@ -47,6 +52,8 @@ class ConvertFileRequest extends FormRequest
                 'required',
                 'file',
                 'max:' . $maxKb,
+                'mimes:' . implode(',', $supportedInputFormats),
+                'mimetypes:' . implode(',', $supportedInputMimes),
             ],
             'format' => [
                 'required',
