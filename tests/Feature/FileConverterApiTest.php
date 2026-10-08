@@ -515,6 +515,45 @@ class FileConverterApiTest extends TestCase
         $this->assertEquals(400, $size[1], 'Target-size compression must retain 400px height');
     }
 
+    public function test_compressing_large_image_to_small_40kb_target_strictly_reaches_target_size(): void
+    {
+        // Create an image larger than 1 MB
+        $tempPath = tempnam(sys_get_temp_dir(), 'test_1mb_target') . '.jpg';
+        $gd = imagecreatetruecolor(2000, 1500);
+        for ($x = 0; $x < 2000; $x += 4) {
+            for ($y = 0; $y < 1500; $y += 4) {
+                $color = imagecolorallocate($gd, ($x * 17) % 256, ($y * 19) % 256, ($x + $y) % 256);
+                imagefilledrectangle($gd, $x, $y, $x + 3, $y + 3, $color);
+            }
+        }
+        imagejpeg($gd, $tempPath, 90);
+        imagedestroy($gd);
+
+        $originalBytes = filesize($tempPath);
+        $this->assertGreaterThan(1000000, $originalBytes, 'Test image should be > 1 MB');
+
+        $file = new UploadedFile($tempPath, 'large_photo.jpg', 'image/jpeg', null, true);
+
+        // Request target size of 40 KB
+        $response = $this->postJson('/api/files/compress', [
+            'file' => $file,
+            'target_size_kb' => 40,
+        ]);
+
+        @unlink($tempPath);
+
+        $response->assertStatus(200)
+            ->assertJson([
+                'success' => true,
+                'message' => 'File compressed successfully.',
+            ]);
+
+        $processedSize = $response->json('processed_size');
+        // Assert processed size is <= 40 KB (with standard 5% boundary)
+        $this->assertLessThanOrEqual(40 * 1024 * 1.05, $processedSize, 'Processed size must reach ~40 KB target');
+        $this->assertLessThan($originalBytes, $processedSize, 'Processed size must be strictly smaller than 1.1MB original');
+    }
+
     public function test_compression_preserves_original_dimensions_without_downscaling_or_blurring(): void
     {
         $tempPath = tempnam(sys_get_temp_dir(), 'test_dim') . '.jpg';

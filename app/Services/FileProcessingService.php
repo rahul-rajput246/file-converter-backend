@@ -968,20 +968,32 @@ class FileProcessingService
             // Guarantee compressed size never exceeds original size
             if (strlen($binaryData) >= $originalSize) {
                 if ($format === 'jpg') {
-                    foreach ([40, 30, 20] as $fallbackQ) {
-                        $fallback = (string) Image::read($tempFullPath)->toJpeg(quality: $fallbackQ);
-                        if (strlen($fallback) < $originalSize) {
-                            $binaryData = $fallback;
-                            break;
+                    $gd = @imagecreatefromjpeg($tempFullPath);
+                    if ($gd) {
+                        foreach ([40, 30, 20] as $fallbackQ) {
+                            ob_start();
+                            imagejpeg($gd, null, $fallbackQ);
+                            $fallback = ob_get_clean();
+                            if ($fallback !== false && strlen($fallback) < $originalSize) {
+                                $binaryData = $fallback;
+                                break;
+                            }
                         }
+                        imagedestroy($gd);
                     }
                 } elseif ($format === 'webp') {
-                    foreach ([40, 30, 20] as $fallbackQ) {
-                        $fallback = (string) Image::read($tempFullPath)->toWebp(quality: $fallbackQ);
-                        if (strlen($fallback) < $originalSize) {
-                            $binaryData = $fallback;
-                            break;
+                    $gd = @imagecreatefromwebp($tempFullPath);
+                    if ($gd) {
+                        foreach ([40, 30, 20] as $fallbackQ) {
+                            ob_start();
+                            imagewebp($gd, null, $fallbackQ);
+                            $fallback = ob_get_clean();
+                            if ($fallback !== false && strlen($fallback) < $originalSize) {
+                                $binaryData = $fallback;
+                                break;
+                            }
                         }
+                        imagedestroy($gd);
                     }
                 } elseif ($format === 'png') {
                     $testGd = @imagecreatefrompng($tempFullPath);
@@ -1088,20 +1100,21 @@ class FileProcessingService
         }
 
         if (!$gd) {
-            return (string) Image::read($filePath)->toJpeg(quality: 75);
+            return (string) Image::read($filePath)->toJpeg(quality: 70);
         }
 
-        // We want a result <= targetBytes that never exceeds originalSize
+        $origW = imagesx($gd);
+        $origH = imagesy($gd);
         $targetCeiling = min($targetBytes, (int) round($originalSize * 0.98));
 
-        $bestBelowTarget = null;
-        $bestBelowTargetQuality = 0;
-        $bestSmallestData = null;
-        $bestSmallestSize = PHP_INT_MAX;
-
-        // Binary search for highest quality (15 - 95) that fits target size with 1:1 dimensions
-        $low = 15;
+        // Phase 1: Try 1:1 original dimensions across full quality range (10 - 95)
+        $low = 10;
         $high = 95;
+        $best1to1 = null;
+        $best1to1Quality = 0;
+        $smallest1to1 = null;
+        $smallest1to1Size = PHP_INT_MAX;
+
         while ($low <= $high) {
             $mid = (int) (($low + $high) / 2);
             ob_start();
@@ -1111,30 +1124,79 @@ class FileProcessingService
             if ($data !== false && strlen($data) > 0) {
                 $len = strlen($data);
                 if ($len <= $targetCeiling) {
-                    if ($mid > $bestBelowTargetQuality) {
-                        $bestBelowTarget = $data;
-                        $bestBelowTargetQuality = $mid;
+                    if ($mid > $best1to1Quality) {
+                        $best1to1Quality = $mid;
+                        $best1to1 = $data;
                     }
                     $low = $mid + 1; // Try higher quality
                 } else {
-                    $high = $mid - 1; // Too big, step down
+                    $high = $mid - 1; // Try lower quality
                 }
 
-                if ($len < $bestSmallestSize) {
-                    $bestSmallestSize = $len;
-                    $bestSmallestData = $data;
+                if ($len < $smallest1to1Size) {
+                    $smallest1to1Size = $len;
+                    $smallest1to1 = $data;
                 }
+            } else {
+                $high = $mid - 1;
+            }
+        }
+
+        // If 1:1 dimensions fit target size, return immediately (preserving 100% original dimensions)
+        if ($best1to1 !== null) {
+            imagedestroy($gd);
+            return $best1to1;
+        }
+
+        // Phase 2: If 1:1 scale physically cannot reach target size (e.g. 1.11MB image to 40KB),
+        // adaptively downsample using high-fidelity Bicubic interpolation while maintaining high quality (Q=50-85)
+        // so the image stays razor sharp instead of degrading into low-quality JPEG block artifacts.
+        $scaleSteps = [0.90, 0.80, 0.70, 0.60, 0.50, 0.40, 0.30, 0.20, 0.15];
+        foreach ($scaleSteps as $scale) {
+            $newW = max(100, (int) round($origW * $scale));
+            $newH = max(100, (int) round($origH * $scale));
+            $scaledGd = imagescale($gd, $newW, $newH, IMG_BICUBIC);
+            if (!$scaledGd) continue;
+
+            $sLow = 35;
+            $sHigh = 85;
+            $bestScaled = null;
+            $bestScaledQ = 0;
+
+            while ($sLow <= $sHigh) {
+                $sMid = (int) (($sLow + $sHigh) / 2);
+                ob_start();
+                imagejpeg($scaledGd, null, $sMid);
+                $sData = ob_get_clean();
+
+                if ($sData !== false && strlen($sData) > 0) {
+                    $sLen = strlen($sData);
+                    if ($sLen <= $targetCeiling) {
+                        if ($sMid > $bestScaledQ) {
+                            $bestScaledQ = $sMid;
+                            $bestScaled = $sData;
+                        }
+                        $sLow = $sMid + 1;
+                    } else {
+                        $sHigh = $sMid - 1;
+                    }
+                } else {
+                    $sHigh = $sMid - 1;
+                }
+            }
+
+            imagedestroy($scaledGd);
+
+            if ($bestScaled !== null) {
+                imagedestroy($gd);
+                return $bestScaled;
             }
         }
 
         imagedestroy($gd);
 
-        if ($bestBelowTarget !== null) {
-            return $bestBelowTarget;
-        }
-
-        if ($bestSmallestData !== null && $bestSmallestSize < $originalSize) {
-            return $bestSmallestData;
+        if ($smallest1to1 !== null && $smallest1to1Size < $originalSize) {
+            return $smallest1to1;
         }
 
         return (string) file_get_contents($filePath);
@@ -1157,19 +1219,21 @@ class FileProcessingService
         }
 
         if (!$gd) {
-            return (string) Image::read($filePath)->toWebp(quality: 75);
+            return (string) Image::read($filePath)->toWebp(quality: 70);
         }
 
+        $origW = imagesx($gd);
+        $origH = imagesy($gd);
         $targetCeiling = min($targetBytes, (int) round($originalSize * 0.98));
 
-        $bestBelowTarget = null;
-        $bestBelowTargetQuality = 0;
-        $bestSmallestData = null;
-        $bestSmallestSize = PHP_INT_MAX;
-
-        // Binary search for highest quality (15 - 95) that fits target size with 1:1 dimensions
-        $low = 15;
+        // Phase 1: 1:1 scale quality binary search (10 - 95)
+        $low = 10;
         $high = 95;
+        $best1to1 = null;
+        $best1to1Quality = 0;
+        $smallest1to1 = null;
+        $smallest1to1Size = PHP_INT_MAX;
+
         while ($low <= $high) {
             $mid = (int) (($low + $high) / 2);
             ob_start();
@@ -1179,30 +1243,76 @@ class FileProcessingService
             if ($data !== false && strlen($data) > 0) {
                 $len = strlen($data);
                 if ($len <= $targetCeiling) {
-                    if ($mid > $bestBelowTargetQuality) {
-                        $bestBelowTarget = $data;
-                        $bestBelowTargetQuality = $mid;
+                    if ($mid > $best1to1Quality) {
+                        $best1to1Quality = $mid;
+                        $best1to1 = $data;
                     }
                     $low = $mid + 1;
                 } else {
                     $high = $mid - 1;
                 }
 
-                if ($len < $bestSmallestSize) {
-                    $bestSmallestSize = $len;
-                    $bestSmallestData = $data;
+                if ($len < $smallest1to1Size) {
+                    $smallest1to1Size = $len;
+                    $smallest1to1 = $data;
                 }
+            } else {
+                $high = $mid - 1;
+            }
+        }
+
+        if ($best1to1 !== null) {
+            imagedestroy($gd);
+            return $best1to1;
+        }
+
+        // Phase 2: Adaptive Bicubic scaling
+        $scaleSteps = [0.90, 0.80, 0.70, 0.60, 0.50, 0.40, 0.30, 0.20, 0.15];
+        foreach ($scaleSteps as $scale) {
+            $newW = max(100, (int) round($origW * $scale));
+            $newH = max(100, (int) round($origH * $scale));
+            $scaledGd = imagescale($gd, $newW, $newH, IMG_BICUBIC);
+            if (!$scaledGd) continue;
+
+            $sLow = 35;
+            $sHigh = 85;
+            $bestScaled = null;
+            $bestScaledQ = 0;
+
+            while ($sLow <= $sHigh) {
+                $sMid = (int) (($sLow + $sHigh) / 2);
+                ob_start();
+                imagewebp($scaledGd, null, $sMid);
+                $sData = ob_get_clean();
+
+                if ($sData !== false && strlen($sData) > 0) {
+                    $sLen = strlen($sData);
+                    if ($sLen <= $targetCeiling) {
+                        if ($sMid > $bestScaledQ) {
+                            $bestScaledQ = $sMid;
+                            $bestScaled = $sData;
+                        }
+                        $sLow = $sMid + 1;
+                    } else {
+                        $sHigh = $sMid - 1;
+                    }
+                } else {
+                    $sHigh = $sMid - 1;
+                }
+            }
+
+            imagedestroy($scaledGd);
+
+            if ($bestScaled !== null) {
+                imagedestroy($gd);
+                return $bestScaled;
             }
         }
 
         imagedestroy($gd);
 
-        if ($bestBelowTarget !== null) {
-            return $bestBelowTarget;
-        }
-
-        if ($bestSmallestData !== null && $bestSmallestSize < $originalSize) {
-            return $bestSmallestData;
+        if ($smallest1to1 !== null && $smallest1to1Size < $originalSize) {
+            return $smallest1to1;
         }
 
         return (string) file_get_contents($filePath);
@@ -1228,6 +1338,8 @@ class FileProcessingService
             return (string) Image::read($filePath)->toPng();
         }
 
+        $origW = imagesx($gd);
+        $origH = imagesy($gd);
         $targetCeiling = min($targetBytes, (int) round($originalSize * 0.98));
 
         // 1. Lossless truecolor zlib 9 first
@@ -1246,7 +1358,7 @@ class FileProcessingService
         $bestSmallestData = ($lossless !== false && strlen($lossless) > 0) ? $lossless : null;
         $bestSmallestSize = $bestSmallestData ? strlen($bestSmallestData) : PHP_INT_MAX;
 
-        // 2. Palette quantization without dithering ($dither = false for crisp edges, no blur, high compression)
+        // Phase 1: Palette quantization without dithering ($dither = false for crisp edges, no blur) at 1:1 scale
         $colorOptions = [256, 192, 128, 96, 64, 48, 32, 16];
         foreach ($colorOptions as $colors) {
             $testGd = @imagecreatefrompng($filePath);
@@ -1283,11 +1395,48 @@ class FileProcessingService
             }
         }
 
-        imagedestroy($gd);
-
         if ($bestBelowTarget !== null) {
+            imagedestroy($gd);
             return $bestBelowTarget;
         }
+
+        // Phase 2: If 1:1 scale palette cannot reach target, use Bicubic scaling with palette quantization
+        $scaleSteps = [0.85, 0.70, 0.55, 0.40, 0.30, 0.20];
+        foreach ($scaleSteps as $scale) {
+            $newW = max(100, (int) round($origW * $scale));
+            $newH = max(100, (int) round($origH * $scale));
+            $scaledGd = imagescale($gd, $newW, $newH, IMG_BICUBIC);
+            if (!$scaledGd) continue;
+
+            foreach ([256, 128, 64, 32] as $colors) {
+                $copyGd = imagecreatetruecolor($newW, $newH);
+                imagealphablending($copyGd, false);
+                imagesavealpha($copyGd, true);
+                imagecopy($copyGd, $scaledGd, 0, 0, 0, 0, $newW, $newH);
+                imagetruecolortopalette($copyGd, false, $colors);
+
+                ob_start();
+                imagepng($copyGd, null, 9);
+                $sData = ob_get_clean();
+                imagedestroy($copyGd);
+
+                if ($sData !== false && strlen($sData) > 0) {
+                    $sLen = strlen($sData);
+                    if ($sLen <= $targetCeiling) {
+                        imagedestroy($scaledGd);
+                        imagedestroy($gd);
+                        return $sData;
+                    }
+                    if ($sLen < $bestSmallestSize) {
+                        $bestSmallestSize = $sLen;
+                        $bestSmallestData = $sData;
+                    }
+                }
+            }
+            imagedestroy($scaledGd);
+        }
+
+        imagedestroy($gd);
 
         if ($bestSmallestData !== null && $bestSmallestSize < $originalSize) {
             return $bestSmallestData;
@@ -1710,23 +1859,27 @@ class FileProcessingService
             return $this->compressAnimatedGif($filePath, null, $targetBytes);
         }
 
+        $gd = @imagecreatefromgif($filePath);
+        if (!$gd) {
+            $raw = @file_get_contents($filePath);
+            $gd = $raw ? @imagecreatefromstring($raw) : null;
+        }
+
+        if (!$gd) {
+            return (string) file_get_contents($filePath);
+        }
+
+        $origW = imagesx($gd);
+        $origH = imagesy($gd);
         $targetCeiling = min($targetBytes, (int) round($originalSize * 0.98));
         $colorSteps = [256, 224, 192, 160, 128, 96, 64, 48, 32, 16];
         $bestData = null;
         $bestSize = PHP_INT_MAX;
 
+        // Phase 1: 1:1 scale palette reduction without dither
         foreach ($colorSteps as $colors) {
-            $testGd = @imagecreatefromgif($filePath);
-            if (!$testGd) {
-                $raw = @file_get_contents($filePath);
-                $testGd = $raw ? @imagecreatefromstring($raw) : null;
-            }
-            if (!$testGd) continue;
-
-            if (!imageistruecolor($testGd)) {
-                imagepalettetotruecolor($testGd);
-            }
-            // Disabling dither gives sharp pixel boundaries and compact LZW dictionaries
+            $testGd = imagecreatetruecolor($origW, $origH);
+            imagecopy($testGd, $gd, 0, 0, 0, 0, $origW, $origH);
             imagetruecolortopalette($testGd, false, $colors);
 
             ob_start();
@@ -1737,7 +1890,7 @@ class FileProcessingService
             if ($data !== false && strlen($data) > 0) {
                 $len = strlen($data);
                 if ($len <= $targetCeiling) {
-                    // Highest color count that fits within target ceiling preserves maximum quality
+                    imagedestroy($gd);
                     return $data;
                 }
                 if ($len < $bestSize) {
@@ -1747,6 +1900,41 @@ class FileProcessingService
             }
         }
 
+        // Phase 2: Adaptive Bicubic scaling
+        $scaleSteps = [0.85, 0.70, 0.55, 0.40, 0.30, 0.20];
+        foreach ($scaleSteps as $scale) {
+            $newW = max(100, (int) round($origW * $scale));
+            $newH = max(100, (int) round($origH * $scale));
+            $scaledGd = imagescale($gd, $newW, $newH, IMG_BICUBIC);
+            if (!$scaledGd) continue;
+
+            foreach ([128, 64, 32, 16] as $colors) {
+                $copyGd = imagecreatetruecolor($newW, $newH);
+                imagecopy($copyGd, $scaledGd, 0, 0, 0, 0, $newW, $newH);
+                imagetruecolortopalette($copyGd, false, $colors);
+
+                ob_start();
+                imagegif($copyGd, null);
+                $sData = ob_get_clean();
+                imagedestroy($copyGd);
+
+                if ($sData !== false && strlen($sData) > 0) {
+                    $sLen = strlen($sData);
+                    if ($sLen <= $targetCeiling) {
+                        imagedestroy($scaledGd);
+                        imagedestroy($gd);
+                        return $sData;
+                    }
+                    if ($sLen < $bestSize) {
+                        $bestSize = $sLen;
+                        $bestData = $sData;
+                    }
+                }
+            }
+            imagedestroy($scaledGd);
+        }
+
+        imagedestroy($gd);
         return ($bestData !== null && $bestSize < $originalSize) ? $bestData : (string) file_get_contents($filePath);
     }
 
@@ -1829,11 +2017,14 @@ class FileProcessingService
             }
 
             if ($gd) {
+                $origW = imagesx($gd);
+                $origH = imagesy($gd);
                 $bestFitData = null;
                 $bestFitQuality = -1;
                 $smallestData = null;
                 $smallestSize = PHP_INT_MAX;
 
+                // Phase 1: 1:1 scale
                 $low = 15;
                 $high = 90;
                 while ($low <= $high) {
@@ -1862,10 +2053,55 @@ class FileProcessingService
                     }
                 }
 
-                imagedestroy($gd);
                 if ($bestFitData !== null) {
+                    imagedestroy($gd);
                     return $bestFitData;
                 }
+
+                // Phase 2: Adaptive Bicubic scaling
+                $scaleSteps = [0.85, 0.70, 0.55, 0.40, 0.30, 0.20];
+                foreach ($scaleSteps as $scale) {
+                    $newW = max(100, (int) round($origW * $scale));
+                    $newH = max(100, (int) round($origH * $scale));
+                    $scaledGd = imagescale($gd, $newW, $newH, IMG_BICUBIC);
+                    if (!$scaledGd) continue;
+
+                    $sLow = 30;
+                    $sHigh = 80;
+                    $scaledBest = null;
+                    $scaledBestQ = 0;
+
+                    while ($sLow <= $sHigh) {
+                        $sMid = (int) (($sLow + $sHigh) / 2);
+                        ob_start();
+                        imageavif($scaledGd, null, $sMid);
+                        $sData = ob_get_clean();
+
+                        if ($sData !== false && strlen($sData) > 0) {
+                            $sLen = strlen($sData);
+                            if ($sLen <= $targetCeiling) {
+                                if ($sMid > $scaledBestQ) {
+                                    $scaledBestQ = $sMid;
+                                    $scaledBest = $sData;
+                                }
+                                $sLow = $sMid + 1;
+                            } else {
+                                $sHigh = $sMid - 1;
+                            }
+                        } else {
+                            $sHigh = $sMid - 1;
+                        }
+                    }
+
+                    imagedestroy($scaledGd);
+
+                    if ($scaledBest !== null) {
+                        imagedestroy($gd);
+                        return $scaledBest;
+                    }
+                }
+
+                imagedestroy($gd);
                 if ($smallestData !== null && $smallestSize < $originalSize) {
                     return $smallestData;
                 }
@@ -1935,22 +2171,27 @@ class FileProcessingService
      */
     protected function compressBmpToTarget(string $filePath, int $targetBytes, int $originalSize): string
     {
+        $gd = @imagecreatefrombmp($filePath);
+        if (!$gd) {
+            $raw = @file_get_contents($filePath);
+            $gd = $raw ? @imagecreatefromstring($raw) : null;
+        }
+
+        if (!$gd) {
+            return (string) file_get_contents($filePath);
+        }
+
+        $origW = imagesx($gd);
+        $origH = imagesy($gd);
         $targetCeiling = min($targetBytes, (int) round($originalSize * 0.98));
         $colorSteps = [256, 224, 192, 160, 128, 96, 64, 32, 16];
         $bestData = null;
         $bestSize = PHP_INT_MAX;
 
+        // Phase 1: 1:1 scale palette reduction
         foreach ($colorSteps as $colors) {
-            $testGd = @imagecreatefrombmp($filePath);
-            if (!$testGd) {
-                $raw = @file_get_contents($filePath);
-                $testGd = $raw ? @imagecreatefromstring($raw) : null;
-            }
-            if (!$testGd) continue;
-
-            if (!imageistruecolor($testGd)) {
-                imagepalettetotruecolor($testGd);
-            }
+            $testGd = imagecreatetruecolor($origW, $origH);
+            imagecopy($testGd, $gd, 0, 0, 0, 0, $origW, $origH);
             imagetruecolortopalette($testGd, false, $colors);
 
             ob_start();
@@ -1961,6 +2202,7 @@ class FileProcessingService
             if ($data !== false && strlen($data) > 0) {
                 $len = strlen($data);
                 if ($len <= $targetCeiling) {
+                    imagedestroy($gd);
                     return $data;
                 }
                 if ($len < $bestSize) {
@@ -1970,6 +2212,41 @@ class FileProcessingService
             }
         }
 
+        // Phase 2: Adaptive Bicubic scaling
+        $scaleSteps = [0.85, 0.70, 0.55, 0.40, 0.30, 0.20];
+        foreach ($scaleSteps as $scale) {
+            $newW = max(100, (int) round($origW * $scale));
+            $newH = max(100, (int) round($origH * $scale));
+            $scaledGd = imagescale($gd, $newW, $newH, IMG_BICUBIC);
+            if (!$scaledGd) continue;
+
+            foreach ([128, 64, 32, 16] as $colors) {
+                $copyGd = imagecreatetruecolor($newW, $newH);
+                imagecopy($copyGd, $scaledGd, 0, 0, 0, 0, $newW, $newH);
+                imagetruecolortopalette($copyGd, false, $colors);
+
+                ob_start();
+                imagebmp($copyGd, null, true);
+                $sData = ob_get_clean();
+                imagedestroy($copyGd);
+
+                if ($sData !== false && strlen($sData) > 0) {
+                    $sLen = strlen($sData);
+                    if ($sLen <= $targetCeiling) {
+                        imagedestroy($scaledGd);
+                        imagedestroy($gd);
+                        return $sData;
+                    }
+                    if ($sLen < $bestSize) {
+                        $bestSize = $sLen;
+                        $bestData = $sData;
+                    }
+                }
+            }
+            imagedestroy($scaledGd);
+        }
+
+        imagedestroy($gd);
         return ($bestData !== null && $bestSize < $originalSize) ? $bestData : (string) file_get_contents($filePath);
     }
 
