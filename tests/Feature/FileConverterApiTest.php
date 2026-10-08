@@ -543,6 +543,55 @@ class FileConverterApiTest extends TestCase
         $this->assertEquals(180, $size[1], 'Height must match original 180px without downscaling');
     }
 
+    public function test_png_and_gif_compression_strictly_reduces_size_without_size_inflation(): void
+    {
+        // 1. Test PNG compression
+        $pngTemp = tempnam(sys_get_temp_dir(), 'test_png') . '.png';
+        $gd = imagecreatetruecolor(200, 200);
+        for ($x = 0; $x < 200; $x++) {
+            for ($y = 0; $y < 200; $y++) {
+                imagesetpixel($gd, $x, $y, imagecolorallocate($gd, $x % 256, $y % 256, ($x + $y) % 256));
+            }
+        }
+        imagepng($gd, $pngTemp, 0); // Raw uncompressed PNG
+        imagedestroy($gd);
+
+        $pngOriginalSize = filesize($pngTemp);
+        $pngFile = new UploadedFile($pngTemp, 'canvas.png', 'image/png', null, true);
+
+        $pngResp = $this->postJson('/api/files/compress', [
+            'file' => $pngFile,
+            'compression_level' => 'high',
+        ]);
+        @unlink($pngTemp);
+
+        $pngResp->assertStatus(200);
+        $this->assertLessThan($pngOriginalSize, $pngResp->json('processed_size'), 'PNG processed size must be strictly smaller than original');
+
+        // 2. Test GIF compression
+        $gifTemp = tempnam(sys_get_temp_dir(), 'test_gif') . '.gif';
+        $gdGif = imagecreatetruecolor(200, 200);
+        for ($x = 0; $x < 200; $x++) {
+            for ($y = 0; $y < 200; $y++) {
+                imagesetpixel($gdGif, $x, $y, imagecolorallocate($gdGif, ($x * 2) % 256, ($y * 2) % 256, 120));
+            }
+        }
+        imagegif($gdGif, $gifTemp);
+        imagedestroy($gdGif);
+
+        $gifOriginalSize = filesize($gifTemp);
+        $gifFile = new UploadedFile($gifTemp, 'anim.gif', 'image/gif', null, true);
+
+        $gifResp = $this->postJson('/api/files/compress', [
+            'file' => $gifFile,
+            'compression_level' => 'high',
+        ]);
+        @unlink($gifTemp);
+
+        $gifResp->assertStatus(200);
+        $this->assertLessThanOrEqual($gifOriginalSize, $gifResp->json('processed_size'), 'GIF processed size must not exceed original');
+    }
+
     /**
      * Validation Tests:
      * - missing file

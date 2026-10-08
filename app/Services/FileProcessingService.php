@@ -887,7 +887,7 @@ class FileProcessingService
                         if (!imageistruecolor($gd)) {
                             imagepalettetotruecolor($gd);
                         }
-                        imagetruecolortopalette($gd, true, $colors);
+                        imagetruecolortopalette($gd, false, $colors);
                         ob_start();
                         imagegif($gd, null);
                         $fastData = ob_get_clean();
@@ -916,7 +916,7 @@ class FileProcessingService
                     if (!imageistruecolor($gd)) {
                         imagepalettetotruecolor($gd);
                     }
-                    imagetruecolortopalette($gd, true, 256);
+                    imagetruecolortopalette($gd, false, 256);
                     ob_start();
                     imagebmp($gd, null, true);
                     $fastData = ob_get_clean();
@@ -924,7 +924,8 @@ class FileProcessingService
                 }
             }
 
-            if ($fastData !== null && strlen($fastData) > 0) {
+            // Only use fast path result if it is strictly smaller than original size
+            if ($fastData !== null && strlen($fastData) > 0 && strlen($fastData) < $originalSize) {
                 $outputFilename = $this->generateUniqueFilename('compressed', $format);
                 $this->storeProcessedFile($outputFilename, $fastData);
 
@@ -962,6 +963,62 @@ class FileProcessingService
                     'mp3', 'wav', 'ogg', 'aac' => $this->compressAudio($tempFullPath, $format, $compressionLevel),
                     default => $this->compressJpeg($tempFullPath, $compressionLevel, $originalSize),
                 };
+            }
+
+            // Guarantee compressed size never exceeds original size
+            if (strlen($binaryData) >= $originalSize) {
+                if ($format === 'jpg') {
+                    foreach ([40, 30, 20] as $fallbackQ) {
+                        $fallback = (string) Image::read($tempFullPath)->toJpeg(quality: $fallbackQ);
+                        if (strlen($fallback) < $originalSize) {
+                            $binaryData = $fallback;
+                            break;
+                        }
+                    }
+                } elseif ($format === 'webp') {
+                    foreach ([40, 30, 20] as $fallbackQ) {
+                        $fallback = (string) Image::read($tempFullPath)->toWebp(quality: $fallbackQ);
+                        if (strlen($fallback) < $originalSize) {
+                            $binaryData = $fallback;
+                            break;
+                        }
+                    }
+                } elseif ($format === 'png') {
+                    $testGd = @imagecreatefrompng($tempFullPath);
+                    if ($testGd) {
+                        if (!imageistruecolor($testGd)) {
+                            imagepalettetotruecolor($testGd);
+                        }
+                        imagetruecolortopalette($testGd, false, 64);
+                        ob_start();
+                        imagepng($testGd, null, 9);
+                        $fallback = ob_get_clean();
+                        imagedestroy($testGd);
+                        if ($fallback !== false && strlen($fallback) < $originalSize) {
+                            $binaryData = $fallback;
+                        }
+                    }
+                } elseif ($format === 'gif') {
+                    $testGd = @imagecreatefromgif($tempFullPath);
+                    if ($testGd) {
+                        if (!imageistruecolor($testGd)) {
+                            imagepalettetotruecolor($testGd);
+                        }
+                        imagetruecolortopalette($testGd, false, 64);
+                        ob_start();
+                        imagegif($testGd, null);
+                        $fallback = ob_get_clean();
+                        imagedestroy($testGd);
+                        if ($fallback !== false && strlen($fallback) < $originalSize) {
+                            $binaryData = $fallback;
+                        }
+                    }
+                }
+
+                // If compression still exceeds or equals original, return original file so size never inflates
+                if (strlen($binaryData) >= $originalSize) {
+                    $binaryData = (string) file_get_contents($tempFullPath);
+                }
             }
 
             // 3. Store processed file
@@ -1034,37 +1091,53 @@ class FileProcessingService
             return (string) Image::read($filePath)->toJpeg(quality: 75);
         }
 
-        $bestData = null;
-        $bestSize = PHP_INT_MAX;
+        // We want a result <= targetBytes that never exceeds originalSize
+        $targetCeiling = min($targetBytes, (int) round($originalSize * 0.98));
 
-        // Binary search for highest quality that fits target size (quality range 55 - 92, preserving 1:1 dimensions)
-        $low = 55;
-        $high = 92;
+        $bestBelowTarget = null;
+        $bestBelowTargetQuality = 0;
+        $bestSmallestData = null;
+        $bestSmallestSize = PHP_INT_MAX;
+
+        // Binary search for highest quality (15 - 95) that fits target size with 1:1 dimensions
+        $low = 15;
+        $high = 95;
         while ($low <= $high) {
             $mid = (int) (($low + $high) / 2);
             ob_start();
             imagejpeg($gd, null, $mid);
             $data = ob_get_clean();
 
-            if ($data !== false) {
+            if ($data !== false && strlen($data) > 0) {
                 $len = strlen($data);
-                if ($len <= $targetBytes) {
-                    $bestData = $data;
-                    $bestSize = $len;
+                if ($len <= $targetCeiling) {
+                    if ($mid > $bestBelowTargetQuality) {
+                        $bestBelowTarget = $data;
+                        $bestBelowTargetQuality = $mid;
+                    }
                     $low = $mid + 1; // Try higher quality
                 } else {
-                    $high = $mid - 1; // Quality too high, step down
-                    if ($len < $bestSize) {
-                        $bestSize = $len;
-                        $bestData = $data;
-                    }
+                    $high = $mid - 1; // Too big, step down
+                }
+
+                if ($len < $bestSmallestSize) {
+                    $bestSmallestSize = $len;
+                    $bestSmallestData = $data;
                 }
             }
         }
 
         imagedestroy($gd);
 
-        return $bestData ?? (string) Image::read($filePath)->toJpeg(quality: 70);
+        if ($bestBelowTarget !== null) {
+            return $bestBelowTarget;
+        }
+
+        if ($bestSmallestData !== null && $bestSmallestSize < $originalSize) {
+            return $bestSmallestData;
+        }
+
+        return (string) file_get_contents($filePath);
     }
 
     /**
@@ -1087,37 +1160,52 @@ class FileProcessingService
             return (string) Image::read($filePath)->toWebp(quality: 75);
         }
 
-        $bestData = null;
-        $bestSize = PHP_INT_MAX;
+        $targetCeiling = min($targetBytes, (int) round($originalSize * 0.98));
 
-        // Binary search quality with floor at 55 to prevent blurriness, preserving 1:1 dimensions
-        $low = 55;
-        $high = 92;
+        $bestBelowTarget = null;
+        $bestBelowTargetQuality = 0;
+        $bestSmallestData = null;
+        $bestSmallestSize = PHP_INT_MAX;
+
+        // Binary search for highest quality (15 - 95) that fits target size with 1:1 dimensions
+        $low = 15;
+        $high = 95;
         while ($low <= $high) {
             $mid = (int) (($low + $high) / 2);
             ob_start();
             imagewebp($gd, null, $mid);
             $data = ob_get_clean();
 
-            if ($data !== false) {
+            if ($data !== false && strlen($data) > 0) {
                 $len = strlen($data);
-                if ($len <= $targetBytes) {
-                    $bestData = $data;
-                    $bestSize = $len;
+                if ($len <= $targetCeiling) {
+                    if ($mid > $bestBelowTargetQuality) {
+                        $bestBelowTarget = $data;
+                        $bestBelowTargetQuality = $mid;
+                    }
                     $low = $mid + 1;
                 } else {
                     $high = $mid - 1;
-                    if ($len < $bestSize) {
-                        $bestSize = $len;
-                        $bestData = $data;
-                    }
+                }
+
+                if ($len < $bestSmallestSize) {
+                    $bestSmallestSize = $len;
+                    $bestSmallestData = $data;
                 }
             }
         }
 
         imagedestroy($gd);
 
-        return $bestData ?? (string) Image::read($filePath)->toWebp(quality: 70);
+        if ($bestBelowTarget !== null) {
+            return $bestBelowTarget;
+        }
+
+        if ($bestSmallestData !== null && $bestSmallestSize < $originalSize) {
+            return $bestSmallestData;
+        }
+
+        return (string) file_get_contents($filePath);
     }
 
     /**
@@ -1140,26 +1228,26 @@ class FileProcessingService
             return (string) Image::read($filePath)->toPng();
         }
 
-        $bestData = null;
-        $bestSize = PHP_INT_MAX;
+        $targetCeiling = min($targetBytes, (int) round($originalSize * 0.98));
 
-        // Try lossless compression first (zlib 9)
+        // 1. Lossless truecolor zlib 9 first
         imagealphablending($gd, false);
         imagesavealpha($gd, true);
         ob_start();
         imagepng($gd, null, 9);
         $lossless = ob_get_clean();
-        if ($lossless !== false && strlen($lossless) > 0) {
-            $bestData = $lossless;
-            $bestSize = strlen($lossless);
-            if ($bestSize <= $targetBytes) {
-                imagedestroy($gd);
-                return $lossless;
-            }
+        if ($lossless !== false && strlen($lossless) > 0 && strlen($lossless) <= $targetCeiling) {
+            imagedestroy($gd);
+            return $lossless;
         }
 
-        // Try high-palette options (256, 224, 192 colors) to avoid color banding & blur, keeping 1:1 dimensions
-        $colorOptions = [256, 224, 192];
+        $bestBelowTarget = null;
+        $bestBelowTargetColors = 0;
+        $bestSmallestData = ($lossless !== false && strlen($lossless) > 0) ? $lossless : null;
+        $bestSmallestSize = $bestSmallestData ? strlen($bestSmallestData) : PHP_INT_MAX;
+
+        // 2. Palette quantization without dithering ($dither = false for crisp edges, no blur, high compression)
+        $colorOptions = [256, 192, 128, 96, 64, 48, 32, 16];
         foreach ($colorOptions as $colors) {
             $testGd = @imagecreatefrompng($filePath);
             if (!$testGd) {
@@ -1173,7 +1261,7 @@ class FileProcessingService
             }
             imagealphablending($testGd, false);
             imagesavealpha($testGd, true);
-            imagetruecolortopalette($testGd, true, $colors);
+            imagetruecolortopalette($testGd, false, $colors);
 
             ob_start();
             imagepng($testGd, null, 9);
@@ -1182,20 +1270,30 @@ class FileProcessingService
 
             if ($data !== false && strlen($data) > 0) {
                 $len = strlen($data);
-                if ($len < $bestSize) {
-                    $bestSize = $len;
-                    $bestData = $data;
+                if ($len <= $targetCeiling) {
+                    if ($colors > $bestBelowTargetColors) {
+                        $bestBelowTarget = $data;
+                        $bestBelowTargetColors = $colors;
+                    }
                 }
-                if ($len <= $targetBytes) {
-                    imagedestroy($gd);
-                    return $data;
+                if ($len < $bestSmallestSize) {
+                    $bestSmallestSize = $len;
+                    $bestSmallestData = $data;
                 }
             }
         }
 
         imagedestroy($gd);
 
-        return $bestData ?? (string) Image::read($filePath)->toPng();
+        if ($bestBelowTarget !== null) {
+            return $bestBelowTarget;
+        }
+
+        if ($bestSmallestData !== null && $bestSmallestSize < $originalSize) {
+            return $bestSmallestData;
+        }
+
+        return (string) file_get_contents($filePath);
     }
 
     /**
@@ -1210,46 +1308,57 @@ class FileProcessingService
     {
         $colorOptions = match ($compressionLevel) {
             'low' => [256],
-            'medium' => [256, 224],
-            'high' => [256, 224, 192],
-            default => [256, 224],
+            'medium' => [256, 192, 128],
+            'high' => [128, 96, 64, 32],
+            default => [256, 192, 128],
         };
+
+        // Try lossless first
+        $gd = @imagecreatefrompng($filePath);
+        if ($gd) {
+            imagealphablending($gd, false);
+            imagesavealpha($gd, true);
+            ob_start();
+            imagepng($gd, null, 9);
+            $losslessData = ob_get_clean();
+            imagedestroy($gd);
+            if ($losslessData !== false && strlen($losslessData) > 0 && strlen($losslessData) < $originalSize) {
+                return $losslessData;
+            }
+        }
 
         $bestData = null;
         $bestSize = PHP_INT_MAX;
 
         foreach ($colorOptions as $colors) {
-            $gd = @imagecreatefrompng($filePath);
-            if (!$gd) {
+            $testGd = @imagecreatefrompng($filePath);
+            if (!$testGd) {
                 $raw = @file_get_contents($filePath);
-                $gd = $raw ? @imagecreatefromstring($raw) : null;
+                $testGd = $raw ? @imagecreatefromstring($raw) : null;
+            }
+            if (!$testGd) continue;
+
+            if (!imageistruecolor($testGd)) {
+                imagepalettetotruecolor($testGd);
             }
 
-            if (!$gd) {
-                break;
-            }
-
-            if (!imageistruecolor($gd)) {
-                imagepalettetotruecolor($gd);
-            }
-
-            imagealphablending($gd, false);
-            imagesavealpha($gd, true);
-            imagetruecolortopalette($gd, true, $colors);
+            imagealphablending($testGd, false);
+            imagesavealpha($testGd, true);
+            imagetruecolortopalette($testGd, false, $colors);
 
             ob_start();
-            imagepng($gd, null, 9);
+            imagepng($testGd, null, 9);
             $data = ob_get_clean();
-            imagedestroy($gd);
+            imagedestroy($testGd);
 
             if ($data !== false && strlen($data) > 0) {
-                $currentSize = strlen($data);
-                if ($currentSize < $bestSize) {
-                    $bestSize = $currentSize;
+                $len = strlen($data);
+                if ($len < $bestSize) {
+                    $bestSize = $len;
                     $bestData = $data;
                 }
 
-                if ($currentSize < $originalSize) {
+                if ($len < $originalSize) {
                     return $data;
                 }
             }
@@ -1259,21 +1368,7 @@ class FileProcessingService
             return $bestData;
         }
 
-        // Lossless max compression fallback
-        $gd = @imagecreatefrompng($filePath);
-        if ($gd) {
-            imagealphablending($gd, false);
-            imagesavealpha($gd, true);
-            ob_start();
-            imagepng($gd, null, 9);
-            $losslessData = ob_get_clean();
-            imagedestroy($gd);
-            if ($losslessData !== false && strlen($losslessData) < $bestSize) {
-                $bestData = $losslessData;
-            }
-        }
-
-        return $bestData ?? (string) Image::read($filePath)->toPng();
+        return (string) file_get_contents($filePath);
     }
 
     /**
@@ -1309,17 +1404,15 @@ class FileProcessingService
             return $data;
         }
 
-        $bestData = $data ?: null;
-        $bestSize = $data ? strlen($data) : PHP_INT_MAX;
+        $bestData = null;
+        $bestSize = PHP_INT_MAX;
+        if ($data !== false) {
+            $bestData = $data;
+            $bestSize = strlen($data);
+        }
 
-        // Step down quality conservatively so image remains sharp and crisp
-        $stepDownMin = match ($compressionLevel) {
-            'high' => 60,
-            'medium' => 70,
-            default => 75,
-        };
-
-        for ($q = $targetQuality - 5; $q >= $stepDownMin; $q -= 5) {
+        // Step down quality until strictly smaller than originalSize
+        for ($q = $targetQuality - 5; $q >= 20; $q -= 5) {
             ob_start();
             imagejpeg($gd, null, $q);
             $candidate = ob_get_clean();
@@ -1340,7 +1433,11 @@ class FileProcessingService
 
         imagedestroy($gd);
 
-        return $bestData ?? (string) Image::read($filePath)->toJpeg(quality: $targetQuality);
+        if ($bestData !== null && $bestSize < $originalSize) {
+            return $bestData;
+        }
+
+        return (string) file_get_contents($filePath);
     }
 
     /**
@@ -1375,16 +1472,14 @@ class FileProcessingService
             return $data;
         }
 
-        $bestData = $data ?: null;
-        $bestSize = $data ? strlen($data) : PHP_INT_MAX;
+        $bestData = null;
+        $bestSize = PHP_INT_MAX;
+        if ($data !== false) {
+            $bestData = $data;
+            $bestSize = strlen($data);
+        }
 
-        $stepDownMin = match ($compressionLevel) {
-            'high' => 60,
-            'medium' => 70,
-            default => 75,
-        };
-
-        for ($q = $targetQuality - 5; $q >= $stepDownMin; $q -= 5) {
+        for ($q = $targetQuality - 5; $q >= 20; $q -= 5) {
             ob_start();
             imagewebp($gd, null, $q);
             $candidate = ob_get_clean();
@@ -1405,7 +1500,11 @@ class FileProcessingService
 
         imagedestroy($gd);
 
-        return $bestData ?? (string) Image::read($filePath)->toWebp(quality: $targetQuality);
+        if ($bestData !== null && $bestSize < $originalSize) {
+            return $bestData;
+        }
+
+        return (string) file_get_contents($filePath);
     }
 
     /**
@@ -1530,21 +1629,11 @@ class FileProcessingService
             return $this->compressAnimatedGif($filePath, $compressionLevel, null);
         }
 
-        $gd = @imagecreatefromgif($filePath);
-        if (!$gd) {
-            $raw = @file_get_contents($filePath);
-            $gd = $raw ? @imagecreatefromstring($raw) : null;
-        }
-
-        if (!$gd) {
-            return (string) file_get_contents($filePath);
-        }
-
         $colorOptions = match ($compressionLevel) {
-            'low' => [256],
-            'medium' => [256, 224],
-            'high' => [224, 192],
-            default => [256, 224],
+            'low' => [256, 224, 192],
+            'medium' => [224, 192, 160, 128],
+            'high' => [192, 160, 128, 96, 64],
+            default => [224, 192, 160, 128],
         };
 
         $bestData = null;
@@ -1561,7 +1650,8 @@ class FileProcessingService
             if (!imageistruecolor($testGd)) {
                 imagepalettetotruecolor($testGd);
             }
-            imagetruecolortopalette($testGd, true, $colors);
+            // Disabling dithering eliminates noisy grain/blur and dramatically improves LZW compression
+            imagetruecolortopalette($testGd, false, $colors);
 
             ob_start();
             imagegif($testGd, null);
@@ -1575,51 +1665,21 @@ class FileProcessingService
                     $bestData = $data;
                 }
                 if ($len < $originalSize) {
-                    imagedestroy($gd);
                     return $data;
                 }
             }
         }
 
-        imagedestroy($gd);
-        return $bestData ?? (string) file_get_contents($filePath);
-    }
-
-    /**
-     * Compress a GIF to achieve a specific target size in bytes.
-     */
-    protected function compressGifToTarget(string $filePath, int $targetBytes, int $originalSize): string
-    {
-        if ($this->isAnimatedGif($filePath) && $this->hasFfmpeg()) {
-            return $this->compressAnimatedGif($filePath, null, $targetBytes);
-        }
-
-        $gd = @imagecreatefromgif($filePath);
-        if (!$gd) {
-            $raw = @file_get_contents($filePath);
-            $gd = $raw ? @imagecreatefromstring($raw) : null;
-        }
-
-        if (!$gd) {
-            return (string) file_get_contents($filePath);
-        }
-
-        $bestData = null;
-        $bestSize = PHP_INT_MAX;
-
-        $colorSteps = [256, 224, 192];
-        foreach ($colorSteps as $colors) {
+        // Stepping down further if needed to guarantee reduction
+        $fallbackSteps = [96, 64, 48, 32];
+        foreach ($fallbackSteps as $colors) {
             $testGd = @imagecreatefromgif($filePath);
-            if (!$testGd) {
-                $raw = @file_get_contents($filePath);
-                $testGd = $raw ? @imagecreatefromstring($raw) : null;
-            }
             if (!$testGd) continue;
 
             if (!imageistruecolor($testGd)) {
                 imagepalettetotruecolor($testGd);
             }
-            imagetruecolortopalette($testGd, true, $colors);
+            imagetruecolortopalette($testGd, false, $colors);
 
             ob_start();
             imagegif($testGd, null);
@@ -1632,15 +1692,62 @@ class FileProcessingService
                     $bestSize = $len;
                     $bestData = $data;
                 }
-                if ($len <= $targetBytes) {
-                    imagedestroy($gd);
+                if ($len < $originalSize) {
                     return $data;
                 }
             }
         }
 
-        imagedestroy($gd);
-        return $bestData ?? (string) file_get_contents($filePath);
+        return ($bestData !== null && $bestSize < $originalSize) ? $bestData : (string) file_get_contents($filePath);
+    }
+
+    /**
+     * Compress a GIF to achieve a specific target size in bytes.
+     */
+    protected function compressGifToTarget(string $filePath, int $targetBytes, int $originalSize): string
+    {
+        if ($this->isAnimatedGif($filePath) && $this->hasFfmpeg()) {
+            return $this->compressAnimatedGif($filePath, null, $targetBytes);
+        }
+
+        $targetCeiling = min($targetBytes, (int) round($originalSize * 0.98));
+        $colorSteps = [256, 224, 192, 160, 128, 96, 64, 48, 32, 16];
+        $bestData = null;
+        $bestSize = PHP_INT_MAX;
+
+        foreach ($colorSteps as $colors) {
+            $testGd = @imagecreatefromgif($filePath);
+            if (!$testGd) {
+                $raw = @file_get_contents($filePath);
+                $testGd = $raw ? @imagecreatefromstring($raw) : null;
+            }
+            if (!$testGd) continue;
+
+            if (!imageistruecolor($testGd)) {
+                imagepalettetotruecolor($testGd);
+            }
+            // Disabling dither gives sharp pixel boundaries and compact LZW dictionaries
+            imagetruecolortopalette($testGd, false, $colors);
+
+            ob_start();
+            imagegif($testGd, null);
+            $data = ob_get_clean();
+            imagedestroy($testGd);
+
+            if ($data !== false && strlen($data) > 0) {
+                $len = strlen($data);
+                if ($len <= $targetCeiling) {
+                    // Highest color count that fits within target ceiling preserves maximum quality
+                    return $data;
+                }
+                if ($len < $bestSize) {
+                    $bestSize = $len;
+                    $bestData = $data;
+                }
+            }
+        }
+
+        return ($bestData !== null && $bestSize < $originalSize) ? $bestData : (string) file_get_contents($filePath);
     }
 
     /**
@@ -1668,16 +1775,10 @@ class FileProcessingService
                     return $data;
                 }
 
-                $bestData = $data ?: null;
-                $bestSize = $data ? strlen($data) : PHP_INT_MAX;
+                $bestData = ($data !== false && strlen($data) < $originalSize) ? $data : null;
+                $bestSize = $bestData ? strlen($bestData) : PHP_INT_MAX;
 
-                $stepDownMin = match ($compressionLevel) {
-                    'high' => 60,
-                    'medium' => 70,
-                    default => 75,
-                };
-
-                for ($q = $targetQuality - 5; $q >= $stepDownMin; $q -= 5) {
+                for ($q = $targetQuality - 5; $q >= 20; $q -= 5) {
                     ob_start();
                     imageavif($gd, null, $q);
                     $candidate = ob_get_clean();
@@ -1697,13 +1798,20 @@ class FileProcessingService
                 }
 
                 imagedestroy($gd);
-                if ($bestData !== null) {
+                if ($bestData !== null && $bestSize < $originalSize) {
                     return $bestData;
                 }
             }
         }
 
-        return (string) Image::read($filePath)->toAvif(quality: $targetQuality);
+        try {
+            $driverData = (string) Image::read($filePath)->toAvif(quality: $targetQuality);
+            if (strlen($driverData) < $originalSize) {
+                return $driverData;
+            }
+        } catch (\Throwable) {}
+
+        return (string) file_get_contents($filePath);
     }
 
     /**
@@ -1711,6 +1819,8 @@ class FileProcessingService
      */
     protected function compressAvifToTarget(string $filePath, int $targetBytes, int $originalSize): string
     {
+        $targetCeiling = min($targetBytes, (int) round($originalSize * 0.98));
+
         if (function_exists('imageavif')) {
             $gd = @imagecreatefromavif($filePath);
             if (!$gd) {
@@ -1719,11 +1829,12 @@ class FileProcessingService
             }
 
             if ($gd) {
-                $bestData = null;
-                $bestSize = PHP_INT_MAX;
+                $bestFitData = null;
+                $bestFitQuality = -1;
+                $smallestData = null;
+                $smallestSize = PHP_INT_MAX;
 
-                // Binary search quality (min quality 55 to prevent blur, preserving 1:1 dimensions)
-                $low = 55;
+                $low = 15;
                 $high = 90;
                 while ($low <= $high) {
                     $mid = (int) (($low + $high) / 2);
@@ -1731,30 +1842,44 @@ class FileProcessingService
                     imageavif($gd, null, $mid);
                     $data = ob_get_clean();
 
-                    if ($data !== false) {
+                    if ($data !== false && strlen($data) > 0) {
                         $len = strlen($data);
-                        if ($len <= $targetBytes) {
-                            $bestData = $data;
-                            $bestSize = $len;
+                        if ($len <= $targetCeiling) {
+                            if ($mid > $bestFitQuality) {
+                                $bestFitQuality = $mid;
+                                $bestFitData = $data;
+                            }
                             $low = $mid + 1;
                         } else {
                             $high = $mid - 1;
-                            if ($len < $bestSize) {
-                                $bestSize = $len;
-                                $bestData = $data;
+                            if ($len < $smallestSize) {
+                                $smallestSize = $len;
+                                $smallestData = $data;
                             }
                         }
+                    } else {
+                        $high = $mid - 1;
                     }
                 }
 
                 imagedestroy($gd);
-                if ($bestData !== null) {
-                    return $bestData;
+                if ($bestFitData !== null) {
+                    return $bestFitData;
+                }
+                if ($smallestData !== null && $smallestSize < $originalSize) {
+                    return $smallestData;
                 }
             }
         }
 
-        return (string) Image::read($filePath)->toAvif(quality: 70);
+        try {
+            $driverData = (string) Image::read($filePath)->toAvif(quality: 50);
+            if (strlen($driverData) < $originalSize) {
+                return $driverData;
+            }
+        } catch (\Throwable) {}
+
+        return (string) file_get_contents($filePath);
     }
 
     /**
@@ -1762,32 +1887,47 @@ class FileProcessingService
      */
     protected function compressBmp(string $filePath, string $compressionLevel, int $originalSize): string
     {
-        $gd = @imagecreatefrombmp($filePath);
-        if (!$gd) {
-            $raw = @file_get_contents($filePath);
-            $gd = $raw ? @imagecreatefromstring($raw) : null;
-        }
-
-        if (!$gd) {
-            return (string) Image::read($filePath)->toBmp();
-        }
-
-        $colors = match ($compressionLevel) {
-            'high' => 224,
-            default => 256,
+        $colorOptions = match ($compressionLevel) {
+            'high' => [128, 64, 32],
+            'medium' => [192, 128, 64],
+            default => [256, 192, 128],
         };
 
-        if (!imageistruecolor($gd)) {
-            imagepalettetotruecolor($gd);
+        $bestData = null;
+        $bestSize = PHP_INT_MAX;
+
+        foreach ($colorOptions as $colors) {
+            $gd = @imagecreatefrombmp($filePath);
+            if (!$gd) {
+                $raw = @file_get_contents($filePath);
+                $gd = $raw ? @imagecreatefromstring($raw) : null;
+            }
+            if (!$gd) continue;
+
+            if (!imageistruecolor($gd)) {
+                imagepalettetotruecolor($gd);
+            }
+            // Disabling dither allows RLE run-length encoding to compress repeated runs efficiently
+            imagetruecolortopalette($gd, false, $colors);
+
+            ob_start();
+            imagebmp($gd, null, true);
+            $data = ob_get_clean();
+            imagedestroy($gd);
+
+            if ($data !== false && strlen($data) > 0) {
+                $len = strlen($data);
+                if ($len < $bestSize) {
+                    $bestSize = $len;
+                    $bestData = $data;
+                }
+                if ($len < $originalSize) {
+                    return $data;
+                }
+            }
         }
-        imagetruecolortopalette($gd, true, $colors);
 
-        ob_start();
-        imagebmp($gd, null, true);
-        $data = ob_get_clean();
-        imagedestroy($gd);
-
-        return ($data !== false && strlen($data) > 0) ? $data : (string) Image::read($filePath)->toBmp();
+        return ($bestData !== null && $bestSize < $originalSize) ? $bestData : (string) file_get_contents($filePath);
     }
 
     /**
@@ -1795,20 +1935,11 @@ class FileProcessingService
      */
     protected function compressBmpToTarget(string $filePath, int $targetBytes, int $originalSize): string
     {
-        $gd = @imagecreatefrombmp($filePath);
-        if (!$gd) {
-            $raw = @file_get_contents($filePath);
-            $gd = $raw ? @imagecreatefromstring($raw) : null;
-        }
-
-        if (!$gd) {
-            return (string) Image::read($filePath)->toBmp();
-        }
-
+        $targetCeiling = min($targetBytes, (int) round($originalSize * 0.98));
+        $colorSteps = [256, 224, 192, 160, 128, 96, 64, 32, 16];
         $bestData = null;
         $bestSize = PHP_INT_MAX;
 
-        $colorSteps = [256, 224];
         foreach ($colorSteps as $colors) {
             $testGd = @imagecreatefrombmp($filePath);
             if (!$testGd) {
@@ -1820,7 +1951,7 @@ class FileProcessingService
             if (!imageistruecolor($testGd)) {
                 imagepalettetotruecolor($testGd);
             }
-            imagetruecolortopalette($testGd, true, $colors);
+            imagetruecolortopalette($testGd, false, $colors);
 
             ob_start();
             imagebmp($testGd, null, true);
@@ -1829,19 +1960,17 @@ class FileProcessingService
 
             if ($data !== false && strlen($data) > 0) {
                 $len = strlen($data);
+                if ($len <= $targetCeiling) {
+                    return $data;
+                }
                 if ($len < $bestSize) {
                     $bestSize = $len;
                     $bestData = $data;
                 }
-                if ($len <= $targetBytes) {
-                    imagedestroy($gd);
-                    return $data;
-                }
             }
         }
 
-        imagedestroy($gd);
-        return $bestData ?? (string) Image::read($filePath)->toBmp();
+        return ($bestData !== null && $bestSize < $originalSize) ? $bestData : (string) file_get_contents($filePath);
     }
 
     /**
