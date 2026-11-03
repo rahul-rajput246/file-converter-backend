@@ -2661,4 +2661,58 @@ class FileProcessingService
 
         return $deletedCount;
     }
+
+    /**
+     * Crop an uploaded image with rectangular coordinates and export as chosen format.
+     */
+    public function cropImage(UploadedFile $file, int $x, int $y, int $width, int $height, ?string $targetFormat = null, ?int $quality = null): array
+    {
+        $clientExt = strtolower($file->getClientOriginalExtension() ?: 'jpg');
+        $format = strtolower($targetFormat ?: ($clientExt ?: 'jpg'));
+        if ($format === 'jpeg') {
+            $format = 'jpg';
+        }
+        $quality = $quality ?? 90;
+
+        $tempUploadName = $this->generateUniqueFilename('upload', $clientExt ?: 'bin');
+        $this->disk()->putFileAs(config('file_converter.storage.uploads', 'uploads'), $file, $tempUploadName);
+        $tempRelativePath = config('file_converter.storage.uploads', 'uploads') . '/' . $tempUploadName;
+        $tempFullPath = $this->disk()->path($tempRelativePath);
+
+        try {
+            $image = Image::read($tempFullPath);
+            $image->crop($width, $height, $x, $y);
+
+            $binaryData = match ($format) {
+                'jpg', 'jpeg' => (string) $image->toJpeg(quality: $quality),
+                'png' => (string) $image->toPng(),
+                'webp' => (string) $image->toWebp(quality: $quality),
+                'gif' => (string) $image->toGif(),
+                'avif' => (string) $image->toAvif(quality: $quality),
+                'bmp' => (string) $image->toBmp(),
+                default => (string) $image->toJpeg(quality: $quality),
+            };
+
+            $outputFilename = $this->generateUniqueFilename('cropped', $format);
+            $this->storeProcessedFile($outputFilename, $binaryData);
+
+            return [
+                'filename' => $outputFilename,
+                'format' => $format,
+                'width' => $width,
+                'height' => $height,
+                'size' => strlen($binaryData),
+            ];
+        } catch (Throwable $e) {
+            Log::error('Crop error', [
+                'x' => $x, 'y' => $y, 'width' => $width, 'height' => $height,
+                'error' => $e->getMessage(),
+            ]);
+            throw new RuntimeException('Unable to crop the image: ' . $e->getMessage(), 0, $e);
+        } finally {
+            if ($this->disk()->exists($tempRelativePath)) {
+                $this->disk()->delete($tempRelativePath);
+            }
+        }
+    }
 }

@@ -824,4 +824,56 @@ class FileConverterApiTest extends TestCase
         Storage::disk('file_converter')->assertMissing($expiredFile);
         Storage::disk('file_converter')->assertMissing($freshFile);
     }
+
+    /**
+     * Crop Tests
+     */
+    public function test_can_crop_image_with_rectangle_coordinates(): void
+    {
+        $file = UploadedFile::fake()->image('test_crop.jpg', 100, 100);
+
+        $response = $this->postJson('/api/files/crop', [
+            'file' => $file,
+            'x' => 10,
+            'y' => 10,
+            'width' => 50,
+            'height' => 40,
+            'format' => 'png',
+        ]);
+
+        $response->assertStatus(200)
+            ->assertJson([
+                'success' => true,
+                'message' => 'Image cropped successfully.',
+                'width' => 50,
+                'height' => 40,
+                'format' => 'png',
+            ])
+            ->assertJsonStructure([
+                'success',
+                'message',
+                'filename',
+                'format',
+                'width',
+                'height',
+                'size',
+                'download_url',
+            ]);
+
+        $filename = $response->json('filename');
+        $this->assertStringEndsWith('.png', $filename);
+        $this->assertStringStartsWith('cropped_', $filename);
+        Storage::disk('file_converter')->assertExists('processed/' . $filename);
+    }
+
+    public function test_crop_validates_required_parameters(): void
+    {
+        $response = $this->postJson('/api/files/crop', []);
+
+        $response->assertStatus(422)
+            ->assertJson([
+                'success' => false,
+                'message' => 'Validation error',
+            ]);
+    }
 }

@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Http\Requests\ConvertFileRequest;
 use App\Http\Requests\CompressFileRequest;
+use App\Http\Requests\CropFileRequest;
 use App\Http\Requests\BatchConvertRequest;
 use App\Http\Requests\BatchCompressRequest;
 use App\Services\FileProcessingService;
@@ -320,5 +321,49 @@ class FileController extends Controller
             'success' => true,
             'formats' => $formats,
         ], 200);
+    }
+
+    /**
+     * POST /api/files/crop
+     * Crop an uploaded image to specific rectangular coordinates.
+     */
+    public function crop(CropFileRequest $request): JsonResponse
+    {
+        try {
+            $file = $request->file('file');
+            $x = (int) round((float) $request->input('x', 0));
+            $y = (int) round((float) $request->input('y', 0));
+            $width = (int) round((float) $request->input('width', 100));
+            $height = (int) round((float) $request->input('height', 100));
+            $format = $request->input('format');
+            $quality = $request->filled('quality') ? (int) $request->input('quality') : null;
+
+            $result = $this->fileProcessingService->cropImage($file, $x, $y, $width, $height, $format, $quality);
+
+            $isSecure = $request->isSecure() || $request->header('x-forwarded-proto') === 'https' || app()->environment('production');
+            $downloadUrl = $isSecure 
+                ? secure_url("/api/files/download/{$result['filename']}") 
+                : url("/api/files/download/{$result['filename']}");
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Image cropped successfully.',
+                'filename' => $result['filename'],
+                'format' => $result['format'],
+                'width' => $result['width'],
+                'height' => $result['height'],
+                'size' => $result['size'],
+                'download_url' => $downloadUrl,
+            ], 200);
+        } catch (Throwable $e) {
+            Log::error('Crop API Failure', [
+                'error' => $e->getMessage(),
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage() ?: 'Unable to crop the image.',
+            ], 500);
+        }
     }
 }
