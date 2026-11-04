@@ -366,4 +366,80 @@ class FileController extends Controller
             ], 500);
         }
     }
+
+    /**
+     * POST /api/files/fetch-url
+     * Safely import an image from any public internet URL (bypassing browser CORS).
+     */
+    public function fetchUrl(Request $request): JsonResponse
+    {
+        $request->validate([
+            'url' => ['required', 'string', 'url', 'max:2048']
+        ]);
+
+        try {
+            $url = $request->input('url');
+            $data = $this->fileProcessingService->fetchRemoteImage($url);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Remote image fetched successfully.',
+                'filename' => $data['filename'],
+                'mime' => $data['mime'],
+                'size' => $data['size'],
+                'format' => $data['format'],
+                'base64' => $data['base64']
+            ], 200);
+        } catch (Throwable $e) {
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage() ?: 'Unable to fetch image from URL.'
+            ], 422);
+        }
+    }
+
+    /**
+     * POST /api/files/strip-exif
+     * Server-side metadata scrubber. Strips all EXIF, GPS, and personal device tags.
+     */
+    public function stripExif(Request $request): JsonResponse
+    {
+        $request->validate([
+            'file' => ['required', 'file', 'image', 'max:102400'], // 100 MB max
+            'format' => ['nullable', 'string', 'in:jpg,jpeg,png,webp,gif,avif,bmp'],
+            'quality' => ['nullable', 'integer', 'between:10,100']
+        ]);
+
+        try {
+            $file = $request->file('file');
+            $format = $request->input('format');
+            $quality = $request->input('quality');
+
+            $result = $this->fileProcessingService->stripExif($file, $format, $quality);
+
+            $isSecure = $request->isSecure() || $request->header('x-forwarded-proto') === 'https' || app()->environment('production');
+            $downloadUrl = $isSecure 
+                ? secure_url("/api/files/download/{$result['filename']}") 
+                : url("/api/files/download/{$result['filename']}");
+
+            return response()->json([
+                'success' => true,
+                'message' => 'All EXIF and GPS metadata permanently stripped.',
+                'filename' => $result['filename'],
+                'format' => $result['format'],
+                'width' => $result['width'],
+                'height' => $result['height'],
+                'original_size' => $result['original_size'],
+                'processed_size' => $result['processed_size'],
+                'download_url' => $downloadUrl
+            ], 200);
+        } catch (Throwable $e) {
+            Log::error('Strip EXIF API Failure', ['error' => $e->getMessage()]);
+
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage() ?: 'Failed to strip image metadata.'
+            ], 500);
+        }
+    }
 }

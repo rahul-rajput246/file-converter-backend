@@ -876,4 +876,53 @@ class FileConverterApiTest extends TestCase
                 'message' => 'Validation error',
             ]);
     }
+
+    public function test_can_strip_exif_metadata_from_image(): void
+    {
+        $tempPath = tempnam(sys_get_temp_dir(), 'test_strip') . '.jpg';
+        $gd = imagecreatetruecolor(100, 100);
+        $color = imagecolorallocate($gd, 45, 90, 180);
+        imagefill($gd, 0, 0, $color);
+        imagejpeg($gd, $tempPath);
+        imagedestroy($gd);
+
+        $file = new UploadedFile($tempPath, 'camera_photo.jpg', 'image/jpeg', null, true);
+
+        $response = $this->postJson('/api/files/strip-exif', [
+            'file' => $file,
+            'format' => 'jpg',
+        ]);
+
+        @unlink($tempPath);
+
+        $response->assertStatus(200)
+            ->assertJson([
+                'success' => true,
+                'format' => 'jpg',
+            ])
+            ->assertJsonStructure([
+                'success',
+                'message',
+                'filename',
+                'format',
+                'width',
+                'height',
+                'original_size',
+                'processed_size',
+                'download_url',
+            ]);
+
+        $filename = $response->json('filename');
+        $this->assertStringStartsWith('sanitized_', $filename);
+        Storage::disk('file_converter')->assertExists('processed/' . $filename);
+    }
+
+    public function test_fetch_url_validates_malicious_or_private_urls(): void
+    {
+        $response = $this->postJson('/api/files/fetch-url', [
+            'url' => 'http://localhost/secret',
+        ]);
+
+        $response->assertStatus(422);
+    }
 }

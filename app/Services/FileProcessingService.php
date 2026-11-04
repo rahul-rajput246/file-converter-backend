@@ -5,6 +5,7 @@ namespace App\Services;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Http;
 use Intervention\Image\Laravel\Facades\Image;
 use InvalidArgumentException;
 use RuntimeException;
@@ -2709,6 +2710,134 @@ class FileProcessingService
                 'error' => $e->getMessage(),
             ]);
             throw new RuntimeException('Unable to crop the image: ' . $e->getMessage(), 0, $e);
+        } finally {
+            if ($this->disk()->exists($tempRelativePath)) {
+                $this->disk()->delete($tempRelativePath);
+            }
+        }
+    }
+
+    /**
+     * Safely fetch a remote image from the internet (URL import).
+     * Protected against SSRF and private network scanning.
+     */
+    public function fetchRemoteImage(string $url): array
+    {
+        if (!filter_var($url, FILTER_VALIDATE_URL)) {
+            throw new InvalidArgumentException('Invalid image URL format.');
+        }
+
+        $parsed = parse_url($url);
+        $scheme = strtolower($parsed['scheme'] ?? '');
+        if (!in_array($scheme, ['http', 'https'])) {
+            throw new InvalidArgumentException('Only HTTP and HTTPS image URLs are supported.');
+        }
+
+        $host = strtolower($parsed['host'] ?? '');
+        if (in_array($host, ['localhost', '127.0.0.1', '::1']) || str_ends_with($host, '.local') || str_ends_with($host, '.internal')) {
+            throw new InvalidArgumentException('Access to local/private network hosts is prohibited.');
+        }
+
+        $ip = gethostbyname($host);
+        if ($ip !== $host && filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false) {
+            throw new InvalidArgumentException('Access to internal IP address ranges is blocked.');
+        }
+
+        try {
+            $response = Http::timeout(12)
+                ->withHeaders([
+                    'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) FileFlow/2.0 ImageInspector',
+                    'Accept' => 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
+                ])
+                ->get($url);
+
+            if (!$response->successful()) {
+                throw new RuntimeException('Failed to download image from the provided URL (HTTP ' . $response->status() . ').');
+            }
+
+            $contentType = $response->header('Content-Type') ?: 'image/jpeg';
+            if (!str_starts_with($contentType, 'image/')) {
+                throw new InvalidArgumentException('The target URL did not return an image content type (received ' . $contentType . ').');
+            }
+
+            $body = $response->body();
+            $bodyLen = strlen($body);
+
+            if ($bodyLen > 25 * 1024 * 1024) {
+                throw new InvalidArgumentException('Image exceeds the maximum allowed size of 25 MB.');
+            }
+
+            $ext = match (true) {
+                str_contains($contentType, 'png') => 'png',
+                str_contains($contentType, 'webp') => 'webp',
+                str_contains($contentType, 'gif') => 'gif',
+                str_contains($contentType, 'avif') => 'avif',
+                str_contains($contentType, 'bmp') => 'bmp',
+                default => 'jpg',
+            };
+
+            $urlPath = parse_url($url, PHP_URL_PATH);
+            $baseName = $urlPath ? basename($urlPath) : 'internet_image';
+            if (!str_contains($baseName, '.')) {
+                $baseName .= '.' . $ext;
+            }
+
+            return [
+                'base64' => 'data:' . $contentType . ';base64,' . base64_encode($body),
+                'filename' => $baseName,
+                'mime' => $contentType,
+                'size' => $bodyLen,
+                'format' => strtoupper($ext)
+            ];
+        } catch (Throwable $e) {
+            Log::error('Fetch Remote Image Failure', ['url' => $url, 'error' => $e->getMessage()]);
+            throw new RuntimeException('Could not fetch image from internet: ' . $e->getMessage(), 0, $e);
+        }
+    }
+
+    /**
+     * Strip all EXIF / metadata from an uploaded image and store sanitized copy.
+     */
+    public function stripExif(UploadedFile $file, ?string $targetFormat = null, ?int $quality = 95): array
+    {
+        $ext = strtolower($file->getClientOriginalExtension());
+        $format = $targetFormat ? strtolower($targetFormat) : ($ext ?: 'jpg');
+        $quality = $quality ?: 95;
+
+        $tempFilename = 'strip_raw_' . uniqid() . '.' . $ext;
+        $this->disk()->putFileAs('uploads', $file, $tempFilename);
+        $tempRelativePath = 'uploads/' . $tempFilename;
+        $tempFullPath = $this->disk()->path($tempRelativePath);
+
+        try {
+            $image = Image::read($tempFullPath);
+            $width = $image->width();
+            $height = $image->height();
+
+            $binaryData = match ($format) {
+                'jpg', 'jpeg' => (string) $image->toJpeg(quality: $quality),
+                'png' => (string) $image->toPng(),
+                'webp' => (string) $image->toWebp(quality: $quality),
+                'gif' => (string) $image->toGif(),
+                'avif' => (string) $image->toAvif(quality: $quality),
+                'bmp' => (string) $image->toBmp(),
+                default => (string) $image->toJpeg(quality: $quality),
+            };
+
+            $outputFilename = $this->generateUniqueFilename('sanitized', $format);
+            $this->storeProcessedFile($outputFilename, $binaryData);
+
+            return [
+                'filename' => $outputFilename,
+                'format' => $format,
+                'width' => $width,
+                'height' => $height,
+                'original_size' => $file->getSize(),
+                'processed_size' => strlen($binaryData),
+            ];
+        } catch (Throwable $e) {
+            Log::error('Strip EXIF failure', ['error' => $e->getMessage()]);
+            throw new RuntimeException('Unable to sanitize image: ' . $e->getMessage(), 0, $e);
         } finally {
             if ($this->disk()->exists($tempRelativePath)) {
                 $this->disk()->delete($tempRelativePath);

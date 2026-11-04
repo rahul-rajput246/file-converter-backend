@@ -18,6 +18,8 @@ Route::prefix('files')->group(function () {
     Route::post('/compress', [FileController::class, 'compress'])->name('files.compress');
     Route::post('/batch-compress', [FileController::class, 'batchCompress'])->name('files.batch-compress');
     Route::post('/crop', [FileController::class, 'crop'])->name('files.crop');
+    Route::post('/strip-exif', [FileController::class, 'stripExif'])->name('files.strip-exif');
+    Route::post('/fetch-url', [FileController::class, 'fetchUrl'])->name('files.fetch-url');
     Route::post('/create-zip', [FileController::class, 'createZip'])->name('files.create-zip');
     Route::get('/download/{filename}', [FileController::class, 'download'])->name('files.download');
     Route::get('/supported-formats', [FileController::class, 'supportedFormats'])->name('files.supported-formats');
