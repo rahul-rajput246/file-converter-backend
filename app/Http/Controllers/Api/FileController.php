@@ -12,6 +12,9 @@ use App\Services\FileProcessingService;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
 use Symfony\Component\HttpFoundation\BinaryFileResponse;
 use Throwable;
 
@@ -441,5 +444,100 @@ class FileController extends Controller
                 'message' => $e->getMessage() ?: 'Failed to strip image metadata.'
             ], 500);
         }
+    }
+
+    /**
+     * POST /api/files/share-link
+     * Create a secure 1-hour expiring share link for any converted/compressed file.
+     */
+    public function generateShareLink(Request $request): JsonResponse
+    {
+        $request->validate([
+            'filename' => ['required', 'string', 'max:255'],
+            'original_name' => ['nullable', 'string', 'max:255'],
+        ]);
+
+        $filename = basename($request->input('filename'));
+        $disk = Storage::disk(config('file_converter.storage.disk', 'file_converter'));
+
+        if (!$disk->exists('processed/' . $filename)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'The requested file could not be found or has already expired.',
+            ], 404);
+        }
+
+        $size = $disk->size('processed/' . $filename);
+        $token = Str::random(32);
+        $expiresAt = now()->addHour();
+
+        $shareData = [
+            'token' => $token,
+            'filename' => $filename,
+            'original_name' => $request->input('original_name', $filename),
+            'size' => $size,
+            'created_at' => now()->toIso8601String(),
+            'expires_at' => $expiresAt->toIso8601String(),
+            'expires_timestamp' => $expiresAt->timestamp,
+        ];
+
+        Cache::put("fileflow_share_{$token}", $shareData, $expiresAt);
+
+        $isSecure = $request->isSecure() || $request->header('x-forwarded-proto') === 'https' || app()->environment('production');
+        $downloadUrl = $isSecure 
+            ? secure_url("/api/files/download/{$filename}") 
+            : url("/api/files/download/{$filename}");
+
+        return response()->json([
+            'success' => true,
+            'message' => '1-hour expiring share link generated successfully.',
+            'token' => $token,
+            'share_path' => "/share/{$token}",
+            'download_url' => $downloadUrl,
+            'original_name' => $shareData['original_name'],
+            'size' => $size,
+            'expires_at' => $shareData['expires_at'],
+            'expires_timestamp' => $shareData['expires_timestamp'],
+        ], 200);
+    }
+
+    /**
+     * GET /api/files/share/{token}
+     * Retrieve details and verify an active share token.
+     */
+    public function getShareDetails(string $token): JsonResponse
+    {
+        $shareData = Cache::get("fileflow_share_{$token}");
+
+        if (!$shareData) {
+            return response()->json([
+                'success' => false,
+                'message' => 'This share link has expired or is invalid. Files are securely expunged after 1 hour.',
+            ], 404);
+        }
+
+        $disk = Storage::disk(config('file_converter.storage.disk', 'file_converter'));
+        if (!$disk->exists('processed/' . $shareData['filename'])) {
+            return response()->json([
+                'success' => false,
+                'message' => 'This file has already been purged from server memory.',
+            ], 404);
+        }
+
+        $downloadUrl = request()->isSecure() || request()->header('x-forwarded-proto') === 'https' || app()->environment('production')
+            ? secure_url("/api/files/download/{$shareData['filename']}")
+            : url("/api/files/download/{$shareData['filename']}");
+
+        return response()->json([
+            'success' => true,
+            'filename' => $shareData['filename'],
+            'original_name' => $shareData['original_name'],
+            'size' => $shareData['size'],
+            'download_url' => $downloadUrl,
+            'created_at' => $shareData['created_at'],
+            'expires_at' => $shareData['expires_at'],
+            'expires_timestamp' => $shareData['expires_timestamp'],
+            'remaining_seconds' => max(0, $shareData['expires_timestamp'] - now()->timestamp),
+        ], 200);
     }
 }

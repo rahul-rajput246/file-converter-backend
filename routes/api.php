@@ -21,6 +21,8 @@ Route::prefix('files')->group(function () {
     Route::post('/strip-exif', [FileController::class, 'stripExif'])->name('files.strip-exif');
     Route::post('/fetch-url', [FileController::class, 'fetchUrl'])->name('files.fetch-url');
     Route::post('/create-zip', [FileController::class, 'createZip'])->name('files.create-zip');
+    Route::post('/share-link', [FileController::class, 'generateShareLink'])->name('files.share-link');
+    Route::get('/share/{token}', [FileController::class, 'getShareDetails'])->name('files.share-details');
     Route::get('/download/{filename}', [FileController::class, 'download'])->name('files.download');
     Route::get('/supported-formats', [FileController::class, 'supportedFormats'])->name('files.supported-formats');
 });

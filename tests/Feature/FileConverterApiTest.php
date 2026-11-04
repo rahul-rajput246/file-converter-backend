@@ -925,4 +925,67 @@ class FileConverterApiTest extends TestCase
 
         $response->assertStatus(422);
     }
+
+    public function test_can_generate_shareable_link_and_fetch_details(): void
+    {
+        $disk = Storage::disk('file_converter');
+        $sampleName = 'converted_share_test.jpg';
+        $disk->put('processed/' . $sampleName, 'fake-image-binary-content-12345');
+
+        // Generate link
+        $genResponse = $this->postJson('/api/files/share-link', [
+            'filename' => $sampleName,
+            'original_name' => 'my_vacation.jpg',
+        ]);
+
+        $genResponse->assertStatus(200)
+            ->assertJson([
+                'success' => true,
+            ])
+            ->assertJsonStructure([
+                'success',
+                'token',
+                'share_path',
+                'expires_at',
+                'expires_timestamp',
+            ]);
+
+        $token = $genResponse->json('token');
+
+        // Fetch shared details
+        $fetchResponse = $this->getJson('/api/files/share/' . $token);
+        $fetchResponse->assertStatus(200)
+            ->assertJson([
+                'success' => true,
+                'filename' => $sampleName,
+                'original_name' => 'my_vacation.jpg',
+            ])
+            ->assertJsonStructure([
+                'success',
+                'filename',
+                'original_name',
+                'size',
+                'download_url',
+                'created_at',
+                'expires_at',
+                'expires_timestamp',
+                'remaining_seconds',
+            ]);
+    }
+
+    public function test_share_link_fails_for_nonexistent_file(): void
+    {
+        $response = $this->postJson('/api/files/share-link', [
+            'filename' => 'nonexistent_file_999.jpg',
+        ]);
+
+        $response->assertStatus(404);
+    }
+
+    public function test_share_details_fails_for_invalid_token(): void
+    {
+        $response = $this->getJson('/api/files/share/invalid_random_token_xyz');
+
+        $response->assertStatus(404);
+    }
 }
